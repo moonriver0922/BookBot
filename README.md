@@ -43,15 +43,22 @@ python run.py
 
 ## Usage
 
+Subcommand-style CLI:
+
+```bash
+python -m bookbot run --auto
+python -m bookbot run --debug --dry-run
+python -m bookbot analyze --days 14 --compare-days 14
+python -m bookbot plan --days 14 --agent-model codex5.3
+python -m bookbot schedule install
 ```
-python run.py                    # Manual run: book best available slot now
-python run.py --auto             # Wait until 08:30 then book (for cron)
-python run.py --dry-run          # Show what would be booked, no action
-python run.py --debug            # Browser visible + verbose logging
-python run.py --debug --dry-run  # Inspect everything without booking
-python run.py --install-schedule # Install cron/launchd for daily runs
-python run.py --analyze-logs     # Analyze logs (last 14d + previous 14d comparison)
-python run.py -c /path/to/cfg   # Use a specific config file
+
+Legacy flags are still supported for backward compatibility:
+
+```bash
+python run.py --auto
+python run.py --analyze-logs --days 14
+python run.py --agent-plan-logs --days 14
 ```
 
 ## Configuration

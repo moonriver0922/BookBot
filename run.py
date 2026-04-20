@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -34,50 +35,98 @@ def parse_args() -> argparse.Namespace:
         prog="bookbot",
         description="PolyU POSS Sports Facility Auto-Booking Bot",
     )
-    parser.add_argument(
+    sub = parser.add_subparsers(dest="command")
+
+    run_p = sub.add_parser("run", help="Run booking bot")
+    run_p.add_argument(
         "--config", "-c",
         type=str,
         default=None,
         help="Path to config.yaml (default: auto-detect)",
     )
-    parser.add_argument(
+    run_p.add_argument(
         "--auto",
         action="store_true",
         help="Auto mode: wait until 08:30 then book",
     )
-    parser.add_argument(
+    run_p.add_argument(
         "--dry-run",
         action="store_true",
         help="Show what would be booked without actually booking",
     )
-    parser.add_argument(
+    run_p.add_argument(
         "--debug",
         action="store_true",
         help="Run with browser visible (non-headless) and verbose logging",
     )
-    parser.add_argument(
-        "--install-schedule",
-        action="store_true",
-        help="Install cron job / launchd agent for daily 08:29 runs",
-    )
-    parser.add_argument(
-        "--analyze-logs",
-        action="store_true",
-        help="Analyze runtime/feedback logs and print baseline + trend metrics",
-    )
-    parser.add_argument(
-        "--days",
-        type=int,
-        default=14,
-        help="Window size (days) for --analyze-logs",
-    )
-    parser.add_argument(
+
+    analyze_p = sub.add_parser("analyze", help="Analyze runtime/feedback logs")
+    analyze_p.add_argument("--days", type=int, default=14, help="Window size in days")
+    analyze_p.add_argument(
         "--compare-days",
         type=int,
         default=14,
-        help="Previous window size (days) for comparison in --analyze-logs",
+        help="Previous window size (days) for comparison",
     )
-    return parser.parse_args()
+    analyze_p.add_argument(
+        "--debug",
+        action="store_true",
+        help="Verbose logging",
+    )
+
+    plan_p = sub.add_parser("plan", help="Call Cursor Agent for plan-style log analysis")
+    plan_p.add_argument("--days", type=int, default=14, help="Window size in days")
+    plan_p.add_argument(
+        "--agent-model",
+        type=str,
+        default="codex5.3",
+        help="Model passed to cursor-agent (default: codex5.3)",
+    )
+    plan_p.add_argument(
+        "--debug",
+        action="store_true",
+        help="Verbose logging",
+    )
+
+    schedule_p = sub.add_parser("schedule", help="Manage schedule")
+    schedule_p.add_argument(
+        "action",
+        choices=["install"],
+        help="Schedule action",
+    )
+    schedule_p.add_argument(
+        "--debug",
+        action="store_true",
+        help="Verbose logging",
+    )
+
+    # Backward-compat flags (deprecated style) to avoid breaking existing scripts.
+    parser.add_argument("--config", "-c", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--auto", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--dry-run", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--debug", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--install-schedule", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--analyze-logs", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--agent-plan-logs", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--days", type=int, default=14, help=argparse.SUPPRESS)
+    parser.add_argument("--compare-days", type=int, default=14, help=argparse.SUPPRESS)
+    parser.add_argument("--agent-model", type=str, default="codex5.3", help=argparse.SUPPRESS)
+
+    args = parser.parse_args()
+
+    if not args.command:
+        # Map legacy flags to subcommands.
+        if args.install_schedule:
+            args.command = "schedule"
+            args.action = "install"
+        elif args.analyze_logs:
+            args.command = "analyze"
+        elif args.agent_plan_logs:
+            args.command = "plan"
+        else:
+            args.command = "run"
+
+    return args
 
 
 def main() -> None:
@@ -86,15 +135,15 @@ def main() -> None:
 
     # Ensure we're in the project directory
     project_dir = Path(__file__).resolve().parent
-    import os
     os.chdir(project_dir)
 
-    if args.install_schedule:
+    if args.command == "schedule":
         from bookbot.scheduler import install_schedule
-        install_schedule()
+        if args.action == "install":
+            install_schedule()
         return
 
-    if args.analyze_logs:
+    if args.command == "analyze":
         from bookbot.analyze import analyze_logs
 
         report = analyze_logs(
@@ -104,6 +153,21 @@ def main() -> None:
             compare_days=args.compare_days,
         )
         logger.info("\n{}", report.rstrip())
+        return
+
+    if args.command == "plan":
+        from bookbot.agent_plan import run_plan_analysis_with_agent
+
+        rc = run_plan_analysis_with_agent(
+            workspace=project_dir,
+            runtime_path=Path("logs/runtime.jsonl"),
+            feedback_path=Path("logs/feedback.jsonl"),
+            days=args.days,
+            model=args.agent_model,
+        )
+        if rc != 0:
+            logger.error("Agent plan analysis failed with exit code {}", rc)
+            sys.exit(rc)
         return
 
     from bookbot.config import load_config
