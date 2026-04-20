@@ -1,0 +1,39 @@
+credentials:
+  username: "your_net_id"
+  password: "your_password"
+
+preferences:
+  activity: "Badminton"
+  center: "Shaw Sports Complex"            # Primary preferred center
+  centers:                                 # Priority order; others from dropdown auto-appended
+    - "Shaw Sports Complex"
+    - "Kwong On Jubilee Sports Centre"
+  preferred_days: [1, 2, 4]       # 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun
+  time_range:
+    start: "14:00"
+    end: "18:00"
+  slot_priority_starts: []           # Optional: fixed start-time priority, e.g. ["19:30", "18:30", "20:30"]
+  book_days_ahead: 7              # Book the slot N days from now
+  prefer_consecutive: 2           # Prefer 2 consecutive slots (2 hours); fallback to 1
+  weekly_max_slots: 4             # Max slots per week; skip if reached
+
+settings:
+  headless: true                  # Run browser in headless mode
+  timeout: 30000                  # Page timeout in ms
+  retry_count: 6                  # Retry on failure (handles maintenance windows)
+  retry_interval: 5               # Base seconds between retries (exponential backoff)
+  rush_retry_waves: 3
+  rush_pre_fire_ms: 0             # Positive = click Search this many ms before 08:30:00
+  rush_timetable_first_wait_ms: 24000   # Rush: wait for timetable after Search (no re-click)
+  rush_timetable_retry_wait_ms: 16000  # One re-click only if first wait times out
+  rush_retry_offsets_s: [3, 8]    # Extra retry waves at T+3s and T+8s (same evening strategy)
+  same_slot_retry_limit: 3        # Conflict retry attempts for the same slot
+  same_slot_retry_budget_ms: 3000 # Total budget for same-slot conflict retries
+  next_click_backoff_ms: [150, 300, 500]  # Next button short retries before fallback
+
+stealth:
+  human_delay_min: 0.3            # Min seconds between actions
+  human_delay_max: 1.5            # Max seconds between actions
+  typing_delay_min: 50            # Min ms per keystroke
+  typing_delay_max: 150           # Max ms per keystroke
+  use_real_chrome: true           # Use installed Chrome instead of Chromium
