@@ -167,19 +167,13 @@ async def navigate_to_booking(page: Page, config: AppConfig, *, rush: bool = Fal
     logger.success("Reached Make Booking page")
 
     # Step 2: click "Sports Facility" to enter the booking form
-    sports_btn = page.locator(
-        'a:has-text("Sports Facility"), '
-        'button:has-text("Sports Facility"), '
-        'input[value*="Sports"], '
-        '.btn:has-text("Sports Facility"), '
-        'a.btn:has-text("Sports")'
-    )
+    sports_btn = page.locator(config.selectors.sports_facility_button)
     if await sports_btn.count() > 0:
         logger.info("Clicking 'Sports Facility' …")
         await sports_btn.first.click()
         if rush:
             try:
-                await page.wait_for_selector("#actvId", state="visible", timeout=10_000)
+                await page.wait_for_selector(config.selectors.activity, state="visible", timeout=10_000)
             except Exception:
                 await page.wait_for_load_state("domcontentloaded", timeout=5_000)
         else:
@@ -192,7 +186,9 @@ async def navigate_to_booking(page: Page, config: AppConfig, *, rush: bool = Fal
 
         logger.success("Entered Sports Facility booking form")
     else:
-        form_el = await page.query_selector("#actvId, #searchDate, #ctrId")
+        form_el = await page.query_selector(
+            f"{config.selectors.activity}, {config.selectors.search_date}, {config.selectors.center}"
+        )
         if form_el:
             logger.debug("Already on the booking form")
         else:
