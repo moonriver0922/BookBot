@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
+import statistics
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, List, Tuple
 
 from loguru import logger
 
+from bookbot.api_client import BookingApiClient, build_api_session_bridge
 from bookbot.stealth import human_click, human_delay, save_debug_snapshot
 from bookbot.tracker import tracker
 
@@ -21,6 +26,11 @@ if TYPE_CHECKING:
 BOOKING_URL = (
     "https://www40.polyu.edu.hk/starspossfbstud/secure/ui_make_book/make_book.do"
 )
+RUNTIME_LOG_PATH = Path("logs/runtime.jsonl")
+
+
+def _selector_id(selector: str) -> str:
+    return selector[1:] if selector.startswith("#") else selector
 
 
 class FormNotReadyError(Exception):
@@ -178,11 +188,12 @@ async def _wait_for_select_options(page: Page, select_id: str, timeout: int = 10
     return opts
 
 
-async def get_available_centers(page: Page) -> list[dict]:
+async def get_available_centers(page: Page, config: AppConfig) -> list[dict]:
     """Read the center dropdown options currently available."""
+    center_id = _selector_id(config.selectors.center)
     try:
         opts = await page.evaluate(
-            "[...document.getElementById('ctrId')?.options || []]"
+            f"[...document.getElementById('{center_id}')?.options || []]"
             ".filter(o => o.value).map(o => ({value: o.value, text: o.text.trim()}))"
         )
         return opts or []
@@ -208,6 +219,12 @@ async def select_booking_criteria(
     When *rush* is True, skip human delays, screenshots, and form dumps for speed.
     """
     center_name = center_override or config.preferences.center
+    search_date_sel = config.selectors.search_date
+    activity_sel = config.selectors.activity
+    center_sel = config.selectors.center
+    search_date_id = _selector_id(search_date_sel)
+    activity_id = _selector_id(activity_sel)
+    center_id = _selector_id(center_sel)
     logger.info("Selecting booking criteria (date={}, activity={}, center={}) …",
                 target, config.preferences.activity, center_name)
 
@@ -220,7 +237,7 @@ async def select_booking_criteria(
     date_str = target.strftime("%d/%m/%Y")
 
     # --- Date ---
-    date_input = page.locator("#searchDate")
+    date_input = page.locator(search_date_sel)
     if await date_input.count() > 0:
         if not rush:
             date_trigger = page.locator(
@@ -236,14 +253,14 @@ async def select_booking_criteria(
 
         await page.evaluate(
             f"""() => {{
-                const el = document.getElementById('searchDate');
+                const el = document.getElementById('{search_date_id}');
                 if (el) {{
                     el.value = '{date_str}';
                     el.dispatchEvent(new Event('change', {{bubbles: true}}));
                     el.dispatchEvent(new Event('input', {{bubbles: true}}));
                 }}
                 if (typeof jQuery !== 'undefined' && jQuery.datepicker) {{
-                    jQuery('#searchDate').datepicker('hide');
+                    jQuery('{search_date_sel}').datepicker('hide');
                 }}
             }}"""
         )
@@ -256,37 +273,37 @@ async def select_booking_criteria(
         if not rush:
             await human_delay(1.0, 2.0)
     else:
-        logger.warning("Date input #searchDate not found")
-        raise FormNotReadyError("Date input #searchDate not found — form may not have loaded")
+        logger.warning("Date input {} not found", search_date_sel)
+        raise FormNotReadyError(f"Date input {search_date_sel} not found — form may not have loaded")
 
     # --- Activity ---
     logger.debug("Waiting for activity options to load …")
-    actv_opts = await _wait_for_select_options(page, "actvId", timeout=5_000 if rush else 10_000)
+    actv_opts = await _wait_for_select_options(page, activity_id, timeout=5_000 if rush else 10_000)
     logger.debug("Activity options: {}", actv_opts)
 
     if len(actv_opts) <= 1:
-        actv_el = page.locator("#actvId")
+        actv_el = page.locator(activity_sel)
         if await actv_el.count() > 0:
             try:
                 await actv_el.click(timeout=3_000)
             except Exception:
                 logger.debug("Activity dropdown not clickable, triggering via JS")
-                await page.evaluate("document.getElementById('actvId')?.click()")
+                await page.evaluate(f"document.getElementById('{activity_id}')?.click()")
             if not rush:
                 await human_delay(0.5, 1.0)
-            actv_opts = await _wait_for_select_options(page, "actvId", timeout=5_000)
+            actv_opts = await _wait_for_select_options(page, activity_id, timeout=5_000)
             logger.debug("Activity options after click: {}", actv_opts)
 
     activity_done = False
     for opt in actv_opts:
         if config.preferences.activity.lower() in opt.get("text", "").lower():
-            await page.select_option("#actvId", value=opt["value"])
+            await page.select_option(activity_sel, value=opt["value"])
             activity_done = True
             logger.info("Activity selected: {} (value={})", opt["text"], opt["value"])
             if rush:
                 try:
                     await page.wait_for_function(
-                        "() => document.getElementById('ctrId')?.options.length > 1",
+                        f"() => document.getElementById('{center_id}')?.options.length > 1",
                         timeout=5_000,
                     )
                 except Exception:
@@ -297,7 +314,7 @@ async def select_booking_criteria(
             break
 
     if not activity_done and len(actv_opts) > 1:
-        await page.select_option("#actvId", value=actv_opts[1]["value"])
+        await page.select_option(activity_sel, value=actv_opts[1]["value"])
         logger.warning("Target activity not found, selected: {}", actv_opts[1]["text"])
         if not rush:
             await human_delay(1.0, 2.0)
@@ -307,26 +324,26 @@ async def select_booking_criteria(
 
     # --- Center ---
     logger.debug("Waiting for center options to load …")
-    ctr_opts = await _wait_for_select_options(page, "ctrId", timeout=5_000 if rush else 10_000)
+    ctr_opts = await _wait_for_select_options(page, center_id, timeout=5_000 if rush else 10_000)
     logger.debug("Center options: {}", ctr_opts)
 
     if len(ctr_opts) <= 1:
-        ctr_el = page.locator("#ctrId")
+        ctr_el = page.locator(center_sel)
         if await ctr_el.count() > 0:
             try:
                 await ctr_el.click(timeout=3_000)
             except Exception:
                 logger.debug("Center dropdown not clickable, triggering via JS")
-                await page.evaluate("document.getElementById('ctrId')?.click()")
+                await page.evaluate(f"document.getElementById('{center_id}')?.click()")
             if not rush:
                 await human_delay(0.5, 1.0)
-            ctr_opts = await _wait_for_select_options(page, "ctrId", timeout=5_000)
+            ctr_opts = await _wait_for_select_options(page, center_id, timeout=5_000)
             logger.debug("Center options after click: {}", ctr_opts)
 
     center_done = False
     for opt in ctr_opts:
         if center_name.lower() in opt.get("text", "").lower():
-            await page.select_option("#ctrId", value=opt["value"])
+            await page.select_option(center_sel, value=opt["value"])
             center_done = True
             logger.info("Center selected: {} (value={})", opt["text"], opt["value"])
             if not rush:
@@ -335,7 +352,7 @@ async def select_booking_criteria(
             break
 
     if not center_done and len(ctr_opts) > 1:
-        await page.select_option("#ctrId", value=ctr_opts[1]["value"])
+        await page.select_option(center_sel, value=ctr_opts[1]["value"])
         logger.warning("Target center '{}' not found, selected: {}", center_name, ctr_opts[1]["text"])
         if not rush:
             await human_delay(1.0, 2.0)
@@ -347,17 +364,19 @@ async def select_booking_criteria(
         await save_debug_snapshot(page, "06_criteria_selected")
 
     if auto_search:
-        await click_search_button(page, rush=rush)
+        await click_search_button(page, config, rush=rush)
 
 
-async def _click_search_raw(page: Page) -> None:
+async def _click_search_raw(page: Page, config: AppConfig) -> None:
     """Click the Search button without waiting for results."""
-    search_btn = page.locator("#searchButton")
+    search_sel = config.selectors.search_button
+    search_id = _selector_id(search_sel)
+    search_btn = page.locator(search_sel)
     if await search_btn.count() > 0:
         try:
             await search_btn.click(timeout=2_000)
         except Exception:
-            await page.evaluate("document.getElementById('searchButton')?.click()")
+            await page.evaluate(f"document.getElementById('{search_id}')?.click()")
     else:
         fallback = page.locator(
             'button:has-text("Search"), input[value="Search" i], input[type="submit"]'
@@ -368,35 +387,213 @@ async def _click_search_raw(page: Page) -> None:
             logger.warning("No Search button found")
 
 
-async def _wait_for_rush_timetable_ready(tab: Page, timeout_ms: int) -> bool:
-    """Wait until both timetable tables exist (required by scan parser). No Search re-clicks.
+def _metric_center_key(center_name: str) -> str:
+    return (
+        center_name.lower()
+        .replace(" ", "_")
+        .replace("/", "_")
+        .replace("-", "_")
+    )
 
-    Rush mode previously re-clicked Search every 3s while polling; that can abort a slow
-    in-flight AJAX and push first paint past the booking rush window.
-    """
+
+def _build_probe_schedule(total_ms: int, probes: list[int]) -> list[int]:
+    base = sorted({p for p in probes if p > 0})
+    if not base:
+        base = [max(500, total_ms // 3), max(1000, (total_ms * 2) // 3)]
+    schedule: list[int] = []
+    for p in base:
+        if p < total_ms:
+            schedule.append(p)
+    schedule.append(total_ms)
+    # Preserve ordering and de-dup after clamping.
+    final: list[int] = []
+    for p in schedule:
+        if p <= 0:
+            continue
+        if final and p == final[-1]:
+            continue
+        final.append(p)
+    return final
+
+
+def _percentile(values: list[float], p: float) -> float:
+    xs = sorted(values)
+    if not xs:
+        return 0.0
+    idx = int(round((p / 100.0) * (len(xs) - 1)))
+    idx = max(0, min(idx, len(xs) - 1))
+    return xs[idx]
+
+
+def _load_center_timetable_history_s(center_name: str, limit: int = 30) -> list[float]:
+    if not RUNTIME_LOG_PATH.exists():
+        return []
+    out: list[float] = []
+    target_step = f"timetable_load|{center_name}"
     try:
-        await tab.wait_for_function(
-            "() => document.querySelectorAll('table.tt-timetable').length >= 2",
-            timeout=timeout_ms,
-        )
-        return True
+        lines = RUNTIME_LOG_PATH.read_text(encoding="utf-8").splitlines()
     except Exception:
-        return False
+        return []
+    for line in reversed(lines):
+        if len(out) >= limit:
+            break
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        steps = row.get("rush_steps") or row.get("steps") or []
+        if not isinstance(steps, list):
+            continue
+        for st in steps:
+            if not isinstance(st, dict):
+                continue
+            if st.get("step") == target_step:
+                dur = st.get("duration_s")
+                if isinstance(dur, (int, float)) and dur > 0:
+                    out.append(float(dur))
+    return out
 
 
-async def _wait_for_timetable(page: Page, *, timeout_ms: int = 15_000, retries: int = 1) -> bool:
+def _derive_wait_budget_for_center(
+    center_name: str,
+    config: AppConfig,
+    *,
+    mode: str,
+) -> tuple[int, list[int]]:
+    if mode == "first":
+        default_total = int(config.settings.rush_timetable_first_wait_ms)
+    else:
+        default_total = int(config.settings.rush_timetable_retry_wait_ms)
+    total_ms = max(2_000, default_total)
+    probes = list(config.settings.rush_timetable_probe_ms)
+
+    history = _load_center_timetable_history_s(center_name)
+    if history:
+        p90_ms = _percentile(history, 90.0) * 1000.0
+        # Add buffer but cap to avoid over-waiting.
+        adaptive = int(min(max(p90_ms * 1.15, 3_000), 35_000))
+        if mode == "retry":
+            adaptive = int(max(2_500, adaptive * 0.7))
+        total_ms = adaptive
+
+    schedule = _build_probe_schedule(total_ms, probes)
+    return total_ms, schedule
+
+
+async def _probe_timetable_state(tab: Page, config: AppConfig) -> dict:
+    timetable_sel = config.selectors.timetable
+    try:
+        return await tab.evaluate(
+            """(selector) => {
+                const tables = document.querySelectorAll(selector);
+                const tableCount = tables.length;
+                const firstRows = tableCount >= 1 ? tables[0].querySelectorAll('tr').length : 0;
+                const secondRows = tableCount >= 2 ? tables[1].querySelectorAll('tr').length : 0;
+                const totalRows = firstRows + secondRows;
+                const hasGridLikeRows = totalRows >= 6;
+                return {
+                    table_count: tableCount,
+                    first_rows: firstRows,
+                    second_rows: secondRows,
+                    has_grid_like_rows: hasGridLikeRows
+                };
+            }""",
+            timetable_sel,
+        )
+    except Exception:
+        return {
+            "table_count": 0,
+            "first_rows": 0,
+            "second_rows": 0,
+            "has_grid_like_rows": False,
+        }
+
+
+async def _wait_for_rush_timetable_ready(
+    tab: Page,
+    config: AppConfig,
+    *,
+    probe_schedule_ms: list[int],
+    reclick_guard_ms: int,
+    phase: str,
+) -> tuple[bool, dict]:
+    """Stage-based rush wait with guarded re-clicks and probe metrics."""
+    start = time.monotonic()
+    first_table_ms: float | None = None
+    two_tables_ms: float | None = None
+    reclick_count = 0
+    timeout_path = "none"
+    checkpoint_idx = 0
+    last_reclick_elapsed = -10_000.0
+    total_budget_ms = probe_schedule_ms[-1] if probe_schedule_ms else 0
+
+    while True:
+        elapsed_ms = (time.monotonic() - start) * 1000.0
+        state = await _probe_timetable_state(tab, config)
+        table_count = int(state.get("table_count", 0) or 0)
+
+        if table_count >= 1 and first_table_ms is None:
+            first_table_ms = elapsed_ms
+        if table_count >= 2 and bool(state.get("has_grid_like_rows")):
+            two_tables_ms = elapsed_ms
+            return True, {
+                "search_to_first_table_ms": round(first_table_ms or elapsed_ms, 1),
+                "search_to_two_tables_ms": round(two_tables_ms, 1),
+                "reclick_count": reclick_count,
+                "timeout_path": "none",
+                "phase": phase,
+            }
+
+        while checkpoint_idx < len(probe_schedule_ms) and elapsed_ms >= probe_schedule_ms[checkpoint_idx]:
+            # After the first short probe, allow guarded re-clicks at later checkpoints.
+            if checkpoint_idx >= 1 and (elapsed_ms - last_reclick_elapsed) >= reclick_guard_ms:
+                try:
+                    search_id = _selector_id(config.selectors.search_button)
+                    await tab.evaluate(f"document.getElementById('{search_id}')?.click()")
+                    reclick_count += 1
+                    last_reclick_elapsed = elapsed_ms
+                except Exception:
+                    pass
+            checkpoint_idx += 1
+
+        if elapsed_ms >= total_budget_ms:
+            if first_table_ms is None:
+                timeout_path = f"{phase}_first_table_timeout"
+            else:
+                timeout_path = f"{phase}_two_tables_timeout"
+            break
+        await asyncio.sleep(0.08)
+
+    return False, {
+        "search_to_first_table_ms": round(first_table_ms, 1) if first_table_ms is not None else None,
+        "search_to_two_tables_ms": round(two_tables_ms, 1) if two_tables_ms is not None else None,
+        "reclick_count": reclick_count,
+        "timeout_path": timeout_path,
+        "phase": phase,
+    }
+
+
+async def _wait_for_timetable(
+    page: Page,
+    config: AppConfig,
+    *,
+    timeout_ms: int = 15_000,
+    retries: int = 1,
+) -> bool:
     """Wait for the timetable to render. Re-clicks Search on timeout. Returns True if found."""
+    timetable_sel = config.selectors.timetable
+    search_id = _selector_id(config.selectors.search_button)
     for attempt in range(1 + retries):
         try:
             await page.wait_for_selector(
-                "table.tt-timetable", state="attached", timeout=timeout_ms,
+                timetable_sel, state="attached", timeout=timeout_ms,
             )
             return True
         except Exception:
             if attempt < retries:
                 logger.debug("Timetable not found after {}ms, retrying search …", timeout_ms)
                 try:
-                    await page.evaluate("document.getElementById('searchButton')?.click()")
+                    await page.evaluate(f"document.getElementById('{search_id}')?.click()")
                 except Exception:
                     pass
             else:
@@ -408,24 +605,30 @@ async def _wait_for_timetable(page: Page, *, timeout_ms: int = 15_000, retries: 
     return False
 
 
-async def click_search_button(page: Page, *, rush: bool = False) -> None:
+async def click_search_button(page: Page, config: AppConfig, *, rush: bool = False) -> None:
     """Click the Search button on the booking form and wait for timetable results."""
     logger.info("Clicking Search …")
-    await _click_search_raw(page)
-    await _wait_for_timetable(page, timeout_ms=15_000, retries=1)
+    await _click_search_raw(page, config)
+    await _wait_for_timetable(
+        page,
+        config,
+        timeout_ms=15_000,
+        retries=1,
+    )
 
     if not rush:
         await human_delay(2.0, 4.0)
         await save_debug_snapshot(page, "07_search_results")
 
 
-def _extract_timetable_data_js() -> str:
+def _extract_timetable_data_js(config: AppConfig) -> tuple[str, dict]:
     """Return the JS code that extracts the full timetable grid.
 
     Factored out so it can be reused by both single-date and multi-date scans.
     """
-    return """() => {
-        const tables = document.querySelectorAll('table.tt-timetable');
+    return (
+        """({ tableSelector, unavailableMarkers }) => {
+        const tables = document.querySelectorAll(tableSelector);
         if (tables.length < 2) return null;
 
         let timeTable = null, dateTable = null;
@@ -491,8 +694,7 @@ def _extract_timetable_data_js() -> str:
                     const [r, g, b] = [parseInt(m[1]), parseInt(m[2]), parseInt(m[3])];
                     isGray = Math.abs(r - g) < 20 && Math.abs(g - b) < 20 && r > 150;
                 }
-                isGray = isGray || allClasses.includes('not-avail') ||
-                         allClasses.includes('unavail') || allClasses.includes('closed');
+                isGray = isGray || unavailableMarkers.some((marker) => allClasses.includes(marker));
 
                 const isEmpty = bgColor === 'rgba(0, 0, 0, 0)' && html.length < 5;
 
@@ -508,7 +710,12 @@ def _extract_timetable_data_js() -> str:
         }
 
         return { times, dates, grid };
-    }"""
+    }""",
+        {
+            "tableSelector": config.selectors.timetable,
+            "unavailableMarkers": config.selectors.unavailable_class_markers,
+        },
+    )
 
 
 def _slots_from_column(
@@ -560,7 +767,8 @@ async def scan_available_slots(
         await human_delay(1.0, 2.0)
         await save_debug_snapshot(page, "08_slot_grid")
 
-    timetable_data = await page.evaluate(_extract_timetable_data_js())
+    script, args = _extract_timetable_data_js(config)
+    timetable_data = await page.evaluate(script, args)
 
     if not timetable_data:
         logger.warning("Could not parse timetable structure")
@@ -607,7 +815,8 @@ async def scan_available_slots_multi(
     """
     logger.info("Scanning timetable for {} dates at {} …", len(targets), center_name)
 
-    timetable_data = await page.evaluate(_extract_timetable_data_js())
+    script, args = _extract_timetable_data_js(config)
+    timetable_data = await page.evaluate(script, args)
 
     if not timetable_data:
         logger.warning("Could not parse timetable structure")
@@ -757,9 +966,10 @@ async def _find_slot_cell(page: Page, slot: TimeSlot, target: date, config: AppC
     """Locate the timetable cell element for a given time slot on the target date."""
     target_day = target.strftime("%d %b")
 
+    table_selector = config.selectors.timetable
     cell = await page.evaluate_handle(
-        """({ targetDay, startTime, endTime }) => {
-            const tables = document.querySelectorAll('table.tt-timetable');
+        """({ targetDay, startTime, endTime, tableSelector }) => {
+            const tables = document.querySelectorAll(tableSelector);
             if (tables.length < 2) return null;
 
             let timeTable = null, dateTable = null;
@@ -794,7 +1004,12 @@ async def _find_slot_cell(page: Page, slot: TimeSlot, target: date, config: AppC
             const cells = dataRow.querySelectorAll('td');
             return colIdx < cells.length ? cells[colIdx] : null;
         }""",
-        {"targetDay": target_day, "startTime": slot.start, "endTime": slot.end},
+        {
+            "targetDay": target_day,
+            "startTime": slot.start,
+            "endTime": slot.end,
+            "tableSelector": table_selector,
+        },
     )
     return cell
 
@@ -843,7 +1058,7 @@ async def _fast_switch_center(page: Page, center_name: str) -> bool:
     return False
 
 
-async def _click_slots_js(page: Page, slots: List[TimeSlot], target: date) -> int:
+async def _click_slots_js(page: Page, slots: List[TimeSlot], target: date, config: AppConfig) -> int:
     """Click multiple timetable cells in a single JS evaluation.
 
     The POSS timetable binds click handlers on child elements inside <td> cells
@@ -853,9 +1068,10 @@ async def _click_slots_js(page: Page, slots: List[TimeSlot], target: date) -> in
     """
     target_day = target.strftime("%d %b")
     slot_data = [{"start": s.start, "end": s.end} for s in slots]
+    table_selector = config.selectors.timetable
     return await page.evaluate(
-        """({ targetDay, slots }) => {
-            const tables = document.querySelectorAll('table.tt-timetable');
+        """({ targetDay, slots, tableSelector }) => {
+            const tables = document.querySelectorAll(tableSelector);
             if (tables.length < 2) return 0;
 
             let timeTable = null, dateTable = null;
@@ -917,19 +1133,20 @@ async def _click_slots_js(page: Page, slots: List[TimeSlot], target: date) -> in
             }
             return clicked;
         }""",
-        {"targetDay": target_day, "slots": slot_data},
+        {"targetDay": target_day, "slots": slot_data, "tableSelector": table_selector},
     )
 
 
-async def _click_next_fast(page: Page, backoff_ms: list[int]) -> bool:
+async def _click_next_fast(page: Page, next_selector: str, backoff_ms: list[int]) -> bool:
     """Click Next with short retries to avoid a single long blocking wait."""
+    next_ready_sel = f"{next_selector}:not([disabled]), button:has-text('Next')"
     for wait_ms in backoff_ms:
         try:
             await page.wait_for_selector(
-                "#nextButton:not([disabled]), button:has-text('Next')",
+                next_ready_sel,
                 timeout=max(100, wait_ms),
             )
-            next_btn = page.locator("#nextButton:not([disabled]), button:has-text('Next')").first
+            next_btn = page.locator(next_ready_sel).first
             await next_btn.click(timeout=max(100, wait_ms))
             return True
         except Exception:
@@ -938,14 +1155,15 @@ async def _click_next_fast(page: Page, backoff_ms: list[int]) -> bool:
     # JS fallback + keyboard submit for edge cases where click target is unstable.
     try:
         clicked = await page.evaluate(
-            """() => {
-                const btn = document.querySelector('#nextButton:not([disabled])')
+            """(nextSelector) => {
+                const btn = document.querySelector(`${nextSelector}:not([disabled])`)
                     || [...document.querySelectorAll('button')]
                         .find(b => (b.textContent || '').trim().toLowerCase() === 'next');
                 if (!btn) return false;
                 btn.click();
                 return true;
-            }"""
+            }""",
+            next_selector,
         )
         if clicked:
             return True
@@ -974,7 +1192,7 @@ async def book_slots(page: Page, slots_to_book: List[TimeSlot], target: date, co
 
     # ── Step 1: Click slot cells ──
     if rush:
-        booked_count = await _click_slots_js(page, slots_to_book, target)
+        booked_count = await _click_slots_js(page, slots_to_book, target, config)
         for s in slots_to_book[:booked_count]:
             logger.info("Clicked slot {} – {} (via JS)", s.start, s.end)
 
@@ -1025,13 +1243,14 @@ async def book_slots(page: Page, slots_to_book: List[TimeSlot], target: date, co
         await save_debug_snapshot(page, "09_slots_selected")
 
     # ── Step 2: Click Next ──
-    next_btn = page.locator('#nextButton:not([disabled])')
+    next_selector = config.selectors.next_button
+    next_btn = page.locator(f"{next_selector}:not([disabled])")
     if await next_btn.count() == 0:
         next_btn = page.locator('button:has-text("Next")')
     if await next_btn.count() > 0:
         logger.info("Clicking Next …")
         if rush:
-            clicked = await _click_next_fast(page, config.settings.next_click_backoff_ms)
+            clicked = await _click_next_fast(page, next_selector, config.settings.next_click_backoff_ms)
             if not clicked:
                 logger.warning("Fast Next click failed")
                 return False
@@ -1146,7 +1365,14 @@ async def _ensure_booking_form(page: Page, config: AppConfig, *, rush: bool = Fa
     otherwise a new tab will skip the 'Sports Facility' click and all
     subsequent form interactions will fail on hidden elements.
     """
-    actv = page.locator("#actvId")
+    activity_sel = config.selectors.activity
+    activity_id = _selector_id(activity_sel)
+    search_date_id = _selector_id(config.selectors.search_date)
+    center_id = _selector_id(config.selectors.center)
+    search_button_id = _selector_id(config.selectors.search_button)
+    sports_sel = config.selectors.sports_facility_button
+
+    actv = page.locator(activity_sel)
     if await actv.count() > 0:
         try:
             if await actv.first.is_visible(timeout=2_000):
@@ -1155,15 +1381,13 @@ async def _ensure_booking_form(page: Page, config: AppConfig, *, rush: bool = Fa
             pass
         logger.debug("Booking form exists in DOM but is NOT visible — need to click Sports Facility")
 
-    sports_btn = page.locator(
-        'a:has-text("Sports Facility"), button:has-text("Sports Facility")'
-    )
+    sports_btn = page.locator(sports_sel)
     if await sports_btn.count() > 0:
         logger.debug("Clicking Sports Facility button …")
         await sports_btn.first.click()
         if rush:
             try:
-                await page.wait_for_selector("#actvId", state="visible", timeout=10_000)
+                await page.wait_for_selector(activity_sel, state="visible", timeout=10_000)
             except Exception:
                 await page.wait_for_load_state("domcontentloaded", timeout=5_000)
         else:
@@ -1174,38 +1398,36 @@ async def _ensure_booking_form(page: Page, config: AppConfig, *, rush: bool = Fa
         await page.goto(BOOKING_URL, wait_until="domcontentloaded")
         if not rush:
             await human_delay(1.0, 2.0)
-        sports_btn = page.locator(
-            'a:has-text("Sports Facility"), button:has-text("Sports Facility")'
-        )
+        sports_btn = page.locator(sports_sel)
         if await sports_btn.count() > 0:
             await sports_btn.first.click()
             if rush:
                 try:
-                    await page.wait_for_selector("#actvId", state="visible", timeout=10_000)
+                    await page.wait_for_selector(activity_sel, state="visible", timeout=10_000)
                 except Exception:
                     await page.wait_for_load_state("domcontentloaded", timeout=5_000)
             else:
                 await page.wait_for_load_state("networkidle")
                 await human_delay(1.5, 2.5)
 
-    if await page.locator("#actvId").count() == 0:
+    if await page.locator(activity_sel).count() == 0:
         from bookbot.auth import is_maintenance_page, MaintenanceError
         if await is_maintenance_page(page):
             raise MaintenanceError("Booking form page is under maintenance")
-        raise FormNotReadyError("Booking form (#actvId) not found after navigation")
+        raise FormNotReadyError(f"Booking form ({activity_sel}) not found after navigation")
 
     # Readiness hardening: verify key controls are visible and enabled before rush flow continues.
     try:
         await page.wait_for_function(
-            """() => {
-                const dateInput = document.getElementById('searchDate');
-                const actv = document.getElementById('actvId');
-                const ctr = document.getElementById('ctrId');
-                const search = document.getElementById('searchButton');
+            f"""() => {{
+                const dateInput = document.getElementById('{search_date_id}');
+                const actv = document.getElementById('{activity_id}');
+                const ctr = document.getElementById('{center_id}');
+                const search = document.getElementById('{search_button_id}');
                 if (!dateInput || !actv || !ctr || !search) return false;
                 const visible = (el) => !!(el.offsetParent || el.getClientRects().length);
                 return visible(dateInput) && visible(actv) && visible(ctr) && !search.disabled;
-            }""",
+            }}""",
             timeout=5_000 if rush else 10_000,
         )
     except Exception as exc:
@@ -1221,7 +1443,7 @@ async def _build_center_order(page: Page, config: AppConfig) -> list[str]:
     """
     configured = list(config.preferences.centers)
 
-    dropdown_centers = await get_available_centers(page)
+    dropdown_centers = await get_available_centers(page, config)
     dropdown_names = [c["text"] for c in dropdown_centers]
     logger.debug("Centers in dropdown: {}", dropdown_names)
 
@@ -1237,7 +1459,29 @@ async def _build_center_order(page: Page, config: AppConfig) -> list[str]:
 
 async def _async_wait_until(hour: int, minute: int, second: int = 0, *, pre_fire_ms: int = 0) -> None:
     """Sleep until HH:MM:SS (minus pre_fire_ms) with 5ms spin-wait precision."""
-    now = datetime.now()
+    await _async_wait_until_with_offset(
+        hour,
+        minute,
+        second,
+        pre_fire_ms=pre_fire_ms,
+        server_delta_ms=0.0,
+    )
+
+
+async def _async_wait_until_with_offset(
+    hour: int,
+    minute: int,
+    second: int = 0,
+    *,
+    pre_fire_ms: int = 0,
+    server_delta_ms: float = 0.0,
+) -> None:
+    """Wait using server-compensated wall clock when server_delta_ms is provided."""
+    def _server_now() -> datetime:
+        return datetime.now() + timedelta(milliseconds=server_delta_ms)
+
+    now = _server_now()
+    local_now = datetime.now()
     target = now.replace(hour=hour, minute=minute, second=second, microsecond=0)
     if pre_fire_ms > 0:
         target = target - timedelta(milliseconds=pre_fire_ms)
@@ -1248,51 +1492,168 @@ async def _async_wait_until(hour: int, minute: int, second: int = 0, *, pre_fire
     delta = (target - now).total_seconds()
     if pre_fire_ms > 0:
         logger.info(
-            "Preparation complete. Waiting {:.1f}s until {:02d}:{:02d}:{:02d} (pre-fire {}ms) …",
-            delta, hour, minute, second, pre_fire_ms,
+            "Preparation complete. Waiting {:.1f}s until {:02d}:{:02d}:{:02d} (pre-fire {}ms, server_delta={:.1f}ms) …",
+            delta, hour, minute, second, pre_fire_ms, server_delta_ms,
         )
     else:
         logger.info(
-            "Preparation complete. Waiting {:.1f}s until {:02d}:{:02d}:{:02d} to start booking …",
-            delta, hour, minute, second,
+            "Preparation complete. Waiting {:.1f}s until {:02d}:{:02d}:{:02d} (server_delta={:.1f}ms) …",
+            delta, hour, minute, second, server_delta_ms,
         )
 
     if delta > 2:
         await asyncio.sleep(delta - 2)
 
-    while datetime.now() < target:
+    while _server_now() < target:
         await asyncio.sleep(0.005)
 
-    logger.info("Rush time reached: {}", datetime.now().strftime("%H:%M:%S.%f"))
+    logger.info(
+        "Rush time reached: local={} server_adjusted={}",
+        local_now.strftime("%H:%M:%S.%f"),
+        _server_now().strftime("%H:%M:%S.%f"),
+    )
 
 
-async def _warm_connections(center_tabs: list[tuple[str, Page]]) -> None:
+async def _estimate_server_time_delta_ms(
+    tab: Page,
+    config: AppConfig,
+    *,
+    sample_count: int,
+    timeout_ms: int,
+) -> float:
+    """Estimate server-client wall clock delta using Date header midpoint RTT."""
+    deltas: list[float] = []
+    statuses: list[int] = []
+    for _ in range(max(1, sample_count)):
+        start_ms = time.time() * 1000.0
+        try:
+            response = await tab.context.request.fetch(
+                BOOKING_URL,
+                method="HEAD",
+                timeout=timeout_ms,
+            )
+            end_ms = time.time() * 1000.0
+            status = int(response.status)
+            statuses.append(status)
+            headers = response.headers
+            date_header = headers.get("date") or headers.get("Date")
+            if not date_header:
+                continue
+            server_dt = parsedate_to_datetime(date_header)
+            if server_dt is None:
+                continue
+            server_ms = server_dt.timestamp() * 1000.0
+            mid_ms = (start_ms + end_ms) / 2.0
+            deltas.append(server_ms - mid_ms)
+        except Exception:
+            continue
+        await asyncio.sleep(0.05)
+
+    if not deltas:
+        tracker.set_metric("server_time_sync_ok", False)
+        tracker.set_metric("server_time_sync_samples", 0)
+        return 0.0
+
+    median_delta = float(statistics.median(deltas))
+    tracker.set_metric("server_time_sync_ok", True)
+    tracker.set_metric("server_time_sync_samples", len(deltas))
+    tracker.set_metric("server_time_delta_ms", round(median_delta, 1))
+    if statuses:
+        tracker.set_metric("server_time_sync_statuses", statuses[-3:])
+    logger.info(
+        "Server time aligned: delta={:.1f}ms from {} sample(s)",
+        median_delta,
+        len(deltas),
+    )
+    return median_delta
+
+
+async def _compute_server_time_delta_ms(tab: Page, config: AppConfig) -> float:
+    if not config.settings.rush_time_sync_enabled:
+        tracker.set_metric("server_time_sync_ok", False)
+        tracker.set_metric("server_time_sync_disabled", True)
+        return 0.0
+    with tracker.step("server_time_sync"):
+        return await _estimate_server_time_delta_ms(
+            tab,
+            config,
+            sample_count=config.settings.rush_time_sync_samples,
+            timeout_ms=config.settings.rush_time_sync_timeout_ms,
+        )
+
+
+async def _warm_connections(center_tabs: list[tuple[str, Page]], mode: str = "head") -> None:
     """Warm TCP/TLS via lightweight fetch() — no page navigation, forms stay filled.
-
     Unlike the old approach (clicking Search then refilling), this sends a HEAD
-    request from each tab's JS context.  The TCP + TLS handshake happens, but
+    request from each tab's JS context. The TCP + TLS handshake happens, but
     the page DOM is untouched, so we skip the expensive 2-3s refill step.
     """
-    warm_js = """async () => {
+    warm_js_head = """async () => {
         try {
             const r = await fetch(window.location.href, {
                 method: 'HEAD', credentials: 'same-origin', cache: 'no-store',
             });
-            return r.status;
-        } catch(e) { return 0; }
+            return {ok: true, status: r.status};
+        } catch(e) { return {ok: false, status: 0}; }
+    }"""
+    warm_js_mixed = """async () => {
+        const result = {headStatus: 0, getStatus: 0, staticProbe: 0};
+        try {
+            const h = await fetch(window.location.href, {
+                method: 'HEAD', credentials: 'same-origin', cache: 'no-store',
+            });
+            result.headStatus = h.status;
+        } catch (e) {}
+        try {
+            const g = await fetch(window.location.href, {
+                method: 'GET', credentials: 'same-origin', cache: 'no-store',
+            });
+            result.getStatus = g.status;
+            await g.text();
+        } catch (e) {}
+        try {
+            const link = document.querySelector('link[rel="stylesheet"]')?.href;
+            if (link) {
+                const s = await fetch(link, { method: 'GET', cache: 'no-store' });
+                result.staticProbe = s.status;
+            }
+        } catch (e) {}
+        return result;
     }"""
 
+    ok_count = 0
+    fail_count = 0
+
     async def _warm_one(center_name: str, tab: Page) -> None:
+        nonlocal ok_count, fail_count
         try:
-            status = await tab.evaluate(warm_js)
-            logger.debug("Connection warmed for {} (HTTP {})", center_name, status)
+            if mode == "mixed":
+                status = await tab.evaluate(warm_js_mixed)
+                logger.debug("Connection warmed for {} (mixed={})", center_name, status)
+                if isinstance(status, dict) and any(int(status.get(k, 0) or 0) > 0 for k in ("headStatus", "getStatus", "staticProbe")):
+                    ok_count += 1
+                else:
+                    fail_count += 1
+            else:
+                status = await tab.evaluate(warm_js_head)
+                logger.debug("Connection warmed for {} (HEAD={})", center_name, status)
+                if isinstance(status, dict) and bool(status.get("ok")):
+                    ok_count += 1
+                else:
+                    fail_count += 1
         except Exception as exc:
             logger.debug("Warm-up for {} failed (ok): {}", center_name, exc)
+            fail_count += 1
 
     await asyncio.gather(
         *[_warm_one(cn, t) for cn, t in center_tabs],
         return_exceptions=True,
     )
+    total = len(center_tabs)
+    tracker.set_metric("warmup_total_tabs", total)
+    tracker.set_metric("warmup_ok_tabs", ok_count)
+    tracker.set_metric("warmup_failed_tabs", fail_count)
+    tracker.set_metric("warmup_mode", mode)
 
 
 def _slot_signature(slot: TimeSlot) -> tuple[str, str]:
@@ -1313,6 +1674,7 @@ async def _retry_same_slot_lane(
     retry_limit = max(1, config.settings.same_slot_retry_limit)
 
     preferred_sig = {_slot_signature(s) for s in preferred_slots}
+    search_id = _selector_id(config.selectors.search_button)
 
     for _attempt in range(1, retry_limit + 1):
         if time.monotonic() >= deadline:
@@ -1320,8 +1682,14 @@ async def _retry_same_slot_lane(
         tracker.incr_metric("conflict_retries")
 
         try:
-            await tab.evaluate("document.getElementById('searchButton')?.click()")
-            await _wait_for_rush_timetable_ready(tab, timeout_ms=1_500)
+            await tab.evaluate(f"document.getElementById('{search_id}')?.click()")
+            await _wait_for_rush_timetable_ready(
+                tab,
+                config,
+                probe_schedule_ms=[500, 1500],
+                reclick_guard_ms=max(300, config.settings.rush_reclick_guard_ms // 2),
+                phase="conflict_retry",
+            )
         except Exception:
             logger.debug("Conflict retry: search re-fire failed for {}", center_name)
 
@@ -1345,6 +1713,133 @@ async def _retry_same_slot_lane(
     return []
 
 
+def _slots_from_api_payload(payload: dict | None, center_name: str) -> list[TimeSlot]:
+    if not isinstance(payload, dict):
+        return []
+    rows = payload.get("slots") or payload.get("data") or payload.get("results") or []
+    if not isinstance(rows, list):
+        return []
+    out: list[TimeSlot] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        start = str(row.get("start") or row.get("startTime") or "").strip()
+        end = str(row.get("end") or row.get("endTime") or "").strip()
+        available = row.get("available")
+        if not start or not end:
+            continue
+        if available is False:
+            continue
+        out.append(
+            TimeSlot(
+                start=start,
+                end=end,
+                center=center_name,
+                court=str(row.get("court") or row.get("courtName") or ""),
+                available=True,
+            )
+        )
+    return out
+
+
+def _api_submit_success(payload: dict | None, text: str) -> bool:
+    if isinstance(payload, dict):
+        if payload.get("success") is True:
+            return True
+        status = str(payload.get("status") or "").lower()
+        if status in {"ok", "success", "booked", "confirmed"}:
+            return True
+    txt = text.lower()
+    return any(word in txt for word in ("success", "booked", "confirmed"))
+
+
+async def _run_booking_api_first(
+    page: Page,
+    config: AppConfig,
+    *,
+    dry_run: bool,
+    rush_time: tuple[int, int, int] | None,
+) -> bool:
+    with tracker.step("ensure_booking_form_api"):
+        await _ensure_booking_form(page, config, rush=bool(rush_time))
+
+    center_order = await _build_center_order(page, config)
+    target_dates = compute_target_dates(config)
+    if not target_dates:
+        tracker.add_feedback("api_no_preferred_days")
+        return False
+
+    bridge = await build_api_session_bridge(page, config)
+    client = BookingApiClient(config, bridge)
+    if not client.enabled:
+        tracker.add_feedback("api_not_configured")
+        logger.info("API mode configured but endpoints are missing, using fallback behavior")
+        return False
+
+    if rush_time is not None:
+        server_delta_ms = await _compute_server_time_delta_ms(page, config)
+        await _async_wait_until_with_offset(
+            *rush_time,
+            pre_fire_ms=config.settings.rush_pre_fire_ms,
+            server_delta_ms=server_delta_ms,
+        )
+
+    for center_name in center_order:
+        for target in target_dates:
+            search_payload = {
+                "date": target.strftime("%Y-%m-%d"),
+                "activity": config.preferences.activity,
+                "center": center_name,
+            }
+            with tracker.step(f"api_search|{center_name}|{target}"):
+                search_res = await client.search(search_payload)
+            tracker.incr_metric("api_search_attempt_count")
+            if not search_res.ok:
+                tracker.incr_metric("api_search_fail_count")
+                continue
+
+            slots = _slots_from_api_payload(search_res.payload, center_name)
+            best = find_best_booking(slots, config.preferences.weekly_max_slots, config)
+            if not best:
+                continue
+
+            if dry_run:
+                tracker.add_feedback(
+                    "api_dry_run_candidate",
+                    center=center_name,
+                    date=str(target),
+                    slots=[f"{s.start}-{s.end}" for s in best],
+                )
+                return True
+
+            slot = best[0]
+            submit_payload = {
+                "date": target.strftime("%Y-%m-%d"),
+                "activity": config.preferences.activity,
+                "center": center_name,
+                "slot": {
+                    "start": slot.start,
+                    "end": slot.end,
+                },
+            }
+            with tracker.step(f"api_submit|{center_name}|{target}"):
+                submit_res = await client.submit(submit_payload)
+            tracker.incr_metric("api_submit_attempt_count")
+            if submit_res.ok and _api_submit_success(submit_res.payload, submit_res.text):
+                tracker.add_feedback(
+                    "api_booked",
+                    center=center_name,
+                    date=str(target),
+                    slots=[f"{slot.start}-{slot.end}"],
+                )
+                tracker.set_metric("api_path_success", True)
+                return True
+            tracker.incr_metric("api_submit_fail_count")
+
+    tracker.set_metric("api_path_success", False)
+    return False
+
+
 async def run_booking(
     page: Page, config: AppConfig, *,
     dry_run: bool = False,
@@ -1363,6 +1858,24 @@ async def run_booking(
     the critical path from ~50s to ~15s (limited only by server response time).
     """
     rush = rush_time is not None
+    mode = (config.settings.booking_mode or "ui").strip().lower()
+    tracker.set_metric("booking_mode", mode)
+
+    if mode in {"api", "hybrid"}:
+        logger.info("Booking mode={} (API-first path enabled)", mode)
+        with tracker.step("api_first_path"):
+            api_success = await _run_booking_api_first(
+                page,
+                config,
+                dry_run=dry_run,
+                rush_time=rush_time,
+            )
+        if api_success:
+            return True
+        if mode == "api":
+            return False
+        tracker.set_metric("api_fallback_to_ui", True)
+        logger.info("Falling back to UI booking flow (hybrid mode)")
 
     if rush:
         return await _run_booking_rush(page, config, dry_run=dry_run, rush_time=rush_time)
@@ -1448,6 +1961,7 @@ async def _run_booking_rush(
     target_dt = now.replace(hour=rush_time[0], minute=rush_time[1], second=rush_time[2], microsecond=0)
     secs_to_rush = (target_dt - now).total_seconds()
     pre_fire_ms = config.settings.rush_pre_fire_ms
+    server_delta_ms = await _compute_server_time_delta_ms(page, config)
 
     if secs_to_rush > 7:
         sleep_before_warm = secs_to_rush - 5
@@ -1455,12 +1969,20 @@ async def _run_booking_rush(
         await asyncio.sleep(sleep_before_warm)
 
         with tracker.step("warm_connections"):
-            await _warm_connections(center_tabs)
+            await _warm_connections(center_tabs, mode=config.settings.rush_warmup_mode)
 
-        await _async_wait_until(*rush_time, pre_fire_ms=pre_fire_ms)
+        await _async_wait_until_with_offset(
+            *rush_time,
+            pre_fire_ms=pre_fire_ms,
+            server_delta_ms=server_delta_ms,
+        )
     else:
         with tracker.step("rush_wait"):
-            await _async_wait_until(*rush_time, pre_fire_ms=pre_fire_ms)
+            await _async_wait_until_with_offset(
+                *rush_time,
+                pre_fire_ms=pre_fire_ms,
+                server_delta_ms=server_delta_ms,
+            )
 
     # Mark the critical phase — all steps from now go into rush_steps
     tracker.mark_rush_start()
@@ -1471,40 +1993,117 @@ async def _run_booking_rush(
     tracker.set_metric("submit_attempt_count", 0)
     tracker.set_metric("conflict_retries", 0)
     tracker.set_metric("late_success_wave", -1)
+    tracker.set_metric("reclick_count", 0)
+    tracker.set_metric("early_scan_attempt_count", 0)
+    tracker.set_metric("early_scan_hit_count", 0)
 
-    # ── Phase 3+4: Fire search; one long wait (no rapid re-clicks that abort slow AJAX) ──
-    first_wait = config.settings.rush_timetable_first_wait_ms
-    retry_wait = config.settings.rush_timetable_retry_wait_ms
+    # ── Phase 3+4: Fire search with staged probes + guarded re-clicks ──
+    global_reclick_count = 0
 
     async def _fire_and_scan(
         center_name: str, tab: Page,
     ) -> tuple[str, Page, dict[date, List[TimeSlot]], float, float]:
+        nonlocal global_reclick_count
+        search_id = _selector_id(config.selectors.search_button)
         t_search = time.monotonic()
-        await tab.evaluate("document.getElementById('searchButton')?.click()")
+        await tab.evaluate(f"document.getElementById('{search_id}')?.click()")
         logger.info("Search fired: {}", center_name)
 
-        found = await _wait_for_rush_timetable_ready(tab, first_wait)
-        if not found:
-            logger.debug(
-                "{}: timetable not ready after {}ms, single re-click …",
-                center_name, first_wait,
+        first_budget_ms, first_schedule = _derive_wait_budget_for_center(
+            center_name,
+            config,
+            mode="first",
+        )
+        retry_budget_ms, retry_schedule = _derive_wait_budget_for_center(
+            center_name,
+            config,
+            mode="retry",
+        )
+        center_key = _metric_center_key(center_name)
+        tracker.set_metric(f"first_wait_budget_ms|{center_key}", first_budget_ms)
+        tracker.set_metric(f"retry_wait_budget_ms|{center_key}", retry_budget_ms)
+
+        found, first_probe = await _wait_for_rush_timetable_ready(
+            tab,
+            config,
+            probe_schedule_ms=first_schedule,
+            reclick_guard_ms=config.settings.rush_reclick_guard_ms,
+            phase="first",
+        )
+        global_reclick_count += int(first_probe.get("reclick_count", 0) or 0)
+        tracker.set_metric("reclick_count", global_reclick_count)
+
+        first_table_ms = first_probe.get("search_to_first_table_ms")
+        if isinstance(first_table_ms, (int, float)):
+            tracker.set_metric(
+                f"search_to_first_table_ms|{center_key}",
+                first_table_ms,
             )
-            try:
-                await tab.evaluate("document.getElementById('searchButton')?.click()")
-            except Exception:
-                pass
-            found = await _wait_for_rush_timetable_ready(tab, retry_wait)
+
+        early_scan: dict[date, List[TimeSlot]] = {}
+        early_hit = False
+        if isinstance(first_table_ms, (int, float)):
+            tracker.incr_metric("early_scan_attempt_count")
+            early_scan = await scan_available_slots_multi(
+                tab, config, targets=target_dates, center_name=center_name,
+            )
+            early_hit = any(bool(v) for v in early_scan.values())
+            if early_hit:
+                tracker.incr_metric("early_scan_hit_count")
+
+        if not found and not early_hit:
+            found, retry_probe = await _wait_for_rush_timetable_ready(
+                tab,
+                config,
+                probe_schedule_ms=retry_schedule,
+                reclick_guard_ms=config.settings.rush_reclick_guard_ms,
+                phase="retry",
+            )
+            global_reclick_count += int(retry_probe.get("reclick_count", 0) or 0)
+            tracker.set_metric("reclick_count", global_reclick_count)
+            timeout_path = retry_probe.get("timeout_path")
+            if isinstance(timeout_path, str) and timeout_path != "none":
+                tracker.set_metric(f"timeout_path|{center_key}", timeout_path)
+
+            two_ms = retry_probe.get("search_to_two_tables_ms")
+            if isinstance(two_ms, (int, float)):
+                tracker.set_metric(
+                    f"search_to_two_tables_ms|{center_key}",
+                    two_ms,
+                )
+        else:
+            timeout_path = first_probe.get("timeout_path")
+            if isinstance(timeout_path, str) and timeout_path != "none":
+                tracker.set_metric(f"timeout_path|{center_key}", timeout_path)
+
+            two_ms = first_probe.get("search_to_two_tables_ms")
+            if isinstance(two_ms, (int, float)):
+                tracker.set_metric(
+                    f"search_to_two_tables_ms|{center_key}",
+                    two_ms,
+                )
 
         t_timetable_loaded = time.monotonic()
         load_dur = t_timetable_loaded - t_search
 
-        if not found:
-            logger.warning("{}: timetable never loaded after {:.1f}s", center_name, load_dur)
+        if not found and not early_hit:
+            logger.warning(
+                "{}: timetable never reached ready state after {:.1f}s "
+                "(first_budget={}ms, retry_budget={}ms)",
+                center_name,
+                load_dur,
+                first_budget_ms,
+                retry_budget_ms,
+            )
 
         t_scan_start = time.monotonic()
         result = await scan_available_slots_multi(
             tab, config, targets=target_dates, center_name=center_name,
         )
+        if early_scan:
+            for d, slots in early_scan.items():
+                if slots and not result.get(d):
+                    result[d] = slots
         scan_dur = time.monotonic() - t_scan_start
 
         tracker.record_step(f"timetable_load|{center_name}", load_dur)
@@ -1657,10 +2256,11 @@ async def _run_booking_rush(
             async def _retry_one(
                 _cn: str, _tab: Page,
             ) -> tuple[str, Page, dict[date, List[TimeSlot]]]:
+                search_id = _selector_id(config.selectors.search_button)
                 try:
                     await _tab.reload(wait_until="domcontentloaded", timeout=8_000)
                     await _tab.wait_for_selector(
-                        "table.tt-timetable", state="attached", timeout=5_000,
+                        config.selectors.timetable, state="attached", timeout=5_000,
                     )
                 except Exception:
                     try:
@@ -1670,17 +2270,17 @@ async def _run_booking_rush(
                             _tab, ref_date, config,
                             center_override=_cn, auto_search=False, rush=True,
                         )
-                        await _tab.evaluate("document.getElementById('searchButton')?.click()")
+                        await _tab.evaluate(f"document.getElementById('{search_id}')?.click()")
                         for _ in range(5):
                             try:
                                 await _tab.wait_for_selector(
-                                    "table.tt-timetable", state="attached", timeout=3_000,
+                                    config.selectors.timetable, state="attached", timeout=3_000,
                                 )
                                 break
                             except Exception:
                                 try:
                                     await _tab.evaluate(
-                                        "document.getElementById('searchButton')?.click()"
+                                        f"document.getElementById('{search_id}')?.click()"
                                     )
                                 except Exception:
                                     pass

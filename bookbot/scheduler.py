@@ -41,18 +41,31 @@ def generate_crontab_entry() -> str:
     return entry
 
 
-def install_crontab() -> None:
-    entry = generate_crontab_entry()
-    logger.info("Installing crontab entry:\n  {}", entry)
+def generate_review_crontab_entry() -> str:
+    python = sys.executable
+    script = str(Path(__file__).resolve().parent.parent / "run.py")
+    entry = f"0 9 * * * cd \"{Path(script).parent}\" && {python} {script} review --days 14 --auto-fix"
+    return entry
+
+
+def _install_crontab_entries(entries: list[str]) -> None:
+    if not entries:
+        return
 
     result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
     existing = result.stdout if result.returncode == 0 else ""
+    to_add: list[str] = []
+    for entry in entries:
+        if entry in existing:
+            logger.info("Crontab entry already exists:\n  {}", entry)
+            continue
+        to_add.append(entry)
 
-    if entry in existing:
-        logger.info("Crontab entry already exists")
+    if not to_add:
+        logger.info("No new crontab entries to install")
         return
 
-    new_crontab = existing.rstrip("\n") + "\n" + entry + "\n"
+    new_crontab = existing.rstrip("\n") + "\n" + "\n".join(to_add) + "\n"
     proc = subprocess.run(
         ["crontab", "-"],
         input=new_crontab,
@@ -60,9 +73,21 @@ def install_crontab() -> None:
         text=True,
     )
     if proc.returncode == 0:
-        logger.success("Crontab installed successfully")
+        logger.success("Crontab entries installed successfully")
     else:
-        logger.error("Failed to install crontab: {}", proc.stderr)
+        logger.error("Failed to install crontab entries: {}", proc.stderr)
+
+
+def install_crontab() -> None:
+    entry = generate_crontab_entry()
+    logger.info("Installing booking crontab entry:\n  {}", entry)
+    _install_crontab_entries([entry])
+
+
+def install_review_crontab() -> None:
+    entry = generate_review_crontab_entry()
+    logger.info("Installing review crontab entry:\n  {}", entry)
+    _install_crontab_entries([entry])
 
 
 def generate_launchd_plist() -> str:
@@ -129,3 +154,9 @@ def install_schedule() -> None:
     else:
         install_crontab()
     logger.info("Scheduled to run daily at 08:20 (bot prepares early, waits until 08:30:00 to search)")
+
+
+def install_review_schedule() -> None:
+    """Install the daily 09:00 review task (local crontab)."""
+    install_review_crontab()
+    logger.info("Scheduled review to run daily at 09:00")

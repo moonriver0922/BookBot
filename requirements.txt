@@ -3,3 +3,4 @@ playwright-stealth
 pyyaml
 loguru
 schedule
+httpx

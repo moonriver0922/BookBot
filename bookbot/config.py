@@ -11,6 +11,10 @@ CONFIG_SEARCH_PATHS = [
     Path("config.yaml"),
     Path(__file__).resolve().parent.parent / "config.yaml",
 ]
+AUTO_TUNING_SEARCH_PATHS = [
+    Path("auto_tuning.yaml"),
+    Path(__file__).resolve().parent.parent / "auto_tuning.yaml",
+]
 
 DEFAULTS = {
     "preferences": {
@@ -34,6 +38,9 @@ DEFAULTS = {
         "rush_pre_fire_ms": 0,
         "rush_timetable_first_wait_ms": 24000,
         "rush_timetable_retry_wait_ms": 16000,
+        "rush_timetable_probe_ms": [1200, 3200, 6800],
+        "rush_reclick_guard_ms": 1400,
+        "rush_warmup_mode": "mixed",
         "rush_retry_offsets_s": [3, 8],
         "same_slot_retry_limit": 3,
         "same_slot_retry_budget_ms": 3000,
@@ -45,6 +52,24 @@ DEFAULTS = {
         "typing_delay_min": 50,
         "typing_delay_max": 150,
         "use_real_chrome": True,
+    },
+    "selectors": {
+        "search_date": "#searchDate",
+        "activity": "#actvId",
+        "center": "#ctrId",
+        "search_button": "#searchButton",
+        "next_button": "#nextButton",
+        "timetable": "table.tt-timetable",
+        "sports_facility_button": 'a:has-text("Sports Facility"), button:has-text("Sports Facility")',
+        "unavailable_class_markers": ["not-avail", "unavail", "closed"],
+    },
+    "api": {
+        "enabled": False,
+        "base_url": "https://www40.polyu.edu.hk",
+        "search_endpoint": "",
+        "submit_endpoint": "",
+        "request_timeout_ms": 2500,
+        "retry_count": 2,
     },
 }
 
@@ -89,10 +114,17 @@ class Settings:
     rush_pre_fire_ms: int = 0
     rush_timetable_first_wait_ms: int = 24000
     rush_timetable_retry_wait_ms: int = 16000
+    rush_timetable_probe_ms: List[int] = field(default_factory=lambda: [1200, 3200, 6800])
+    rush_reclick_guard_ms: int = 1400
+    rush_warmup_mode: str = "mixed"
     rush_retry_offsets_s: List[int] = field(default_factory=lambda: [3, 8])
     same_slot_retry_limit: int = 3
     same_slot_retry_budget_ms: int = 3000
     next_click_backoff_ms: List[int] = field(default_factory=lambda: [150, 300, 500])
+    booking_mode: str = "ui"
+    rush_time_sync_enabled: bool = True
+    rush_time_sync_samples: int = 5
+    rush_time_sync_timeout_ms: int = 1500
 
 
 @dataclass
@@ -111,11 +143,35 @@ class Credentials:
 
 
 @dataclass
+class Selectors:
+    search_date: str = "#searchDate"
+    activity: str = "#actvId"
+    center: str = "#ctrId"
+    search_button: str = "#searchButton"
+    next_button: str = "#nextButton"
+    timetable: str = "table.tt-timetable"
+    sports_facility_button: str = 'a:has-text("Sports Facility"), button:has-text("Sports Facility")'
+    unavailable_class_markers: List[str] = field(default_factory=lambda: ["not-avail", "unavail", "closed"])
+
+
+@dataclass
+class ApiSettings:
+    enabled: bool = False
+    base_url: str = "https://www40.polyu.edu.hk"
+    search_endpoint: str = ""
+    submit_endpoint: str = ""
+    request_timeout_ms: int = 2500
+    retry_count: int = 2
+
+
+@dataclass
 class AppConfig:
     credentials: Credentials = field(default_factory=Credentials)
     preferences: Preferences = field(default_factory=Preferences)
     settings: Settings = field(default_factory=Settings)
     stealth: StealthConfig = field(default_factory=StealthConfig)
+    selectors: Selectors = field(default_factory=Selectors)
+    api: ApiSettings = field(default_factory=ApiSettings)
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -156,11 +212,20 @@ def load_config(path: str | None = None) -> AppConfig:
         raw = yaml.safe_load(f) or {}
 
     merged = _deep_merge(DEFAULTS, raw)
+    for tuning_path in AUTO_TUNING_SEARCH_PATHS:
+        if tuning_path.is_file():
+            with open(tuning_path, "r", encoding="utf-8") as tf:
+                tuning_raw = yaml.safe_load(tf) or {}
+            if isinstance(tuning_raw, dict):
+                merged = _deep_merge(merged, tuning_raw)
+            break
 
     creds = merged.get("credentials", {})
     prefs = merged.get("preferences", {})
     sett = merged.get("settings", {})
     stl = merged.get("stealth", {})
+    sels = merged.get("selectors", {})
+    api = merged.get("api", {})
 
     tr = prefs.pop("time_range", {})
     time_range = TimeRange(**tr)
@@ -182,4 +247,6 @@ def load_config(path: str | None = None) -> AppConfig:
         ),
         settings=Settings(**sett),
         stealth=StealthConfig(**stl),
+        selectors=Selectors(**sels),
+        api=ApiSettings(**api),
     )
