@@ -1915,6 +1915,14 @@ def _classify_api_submit_outcome(text: str, final_url: str = "") -> tuple[bool, 
 
 def _classify_api_error(phase: str, result: ApiCallResult) -> str:
     haystack = f"{result.error} {result.text}".lower()
+    if result.status_code in {401, 403}:
+        return "auth_required"
+    if result.status_code in {429}:
+        return "rate_limited"
+    if result.status_code >= 500:
+        return "server_error"
+    if result.status_code == 0:
+        return "network_error"
     if "missing_facility_id" in haystack or "facility_id_not_found" in haystack:
         return "missing_facility_id"
     if "submit_form_fields_not_found" in haystack:
@@ -1929,14 +1937,6 @@ def _classify_api_error(phase: str, result: ApiCallResult) -> str:
         return "quota_limit"
     if any(k in haystack for k in ("timeout", "timed out")):
         return f"{phase}_timeout"
-    if result.status_code in {401, 403}:
-        return "auth_required"
-    if result.status_code in {429}:
-        return "rate_limited"
-    if result.status_code >= 500:
-        return "server_error"
-    if result.status_code == 0:
-        return "network_error"
     return f"{phase}_failed"
 
 
