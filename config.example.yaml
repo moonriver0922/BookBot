@@ -26,6 +26,9 @@ settings:
   rush_pre_fire_ms: 0             # Positive = click Search this many ms before 08:30:00
   rush_timetable_first_wait_ms: 24000   # Rush: wait for timetable after Search (no re-click)
   rush_timetable_retry_wait_ms: 16000  # One re-click only if first wait times out
+  rush_timetable_probe_ms: [1200, 3200, 6800]  # Probe checkpoints (ms) before guarded re-click
+  rush_reclick_guard_ms: 1400    # Min gap between guarded Search re-clicks
+  rush_warmup_mode: "mixed"      # head | mixed (HEAD + lightweight GET + static probes)
   rush_retry_offsets_s: [3, 8]    # Extra retry waves at T+3s and T+8s (same evening strategy)
   same_slot_retry_limit: 3        # Conflict retry attempts for the same slot
   same_slot_retry_budget_ms: 3000 # Total budget for same-slot conflict retries

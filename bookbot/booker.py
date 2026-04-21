@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING, List, Tuple
 
 from loguru import logger
@@ -21,6 +23,7 @@ if TYPE_CHECKING:
 BOOKING_URL = (
     "https://www40.polyu.edu.hk/starspossfbstud/secure/ui_make_book/make_book.do"
 )
+RUNTIME_LOG_PATH = Path("logs/runtime.jsonl")
 
 
 class FormNotReadyError(Exception):
@@ -368,20 +371,186 @@ async def _click_search_raw(page: Page) -> None:
             logger.warning("No Search button found")
 
 
-async def _wait_for_rush_timetable_ready(tab: Page, timeout_ms: int) -> bool:
-    """Wait until both timetable tables exist (required by scan parser). No Search re-clicks.
+def _metric_center_key(center_name: str) -> str:
+    return (
+        center_name.lower()
+        .replace(" ", "_")
+        .replace("/", "_")
+        .replace("-", "_")
+    )
 
-    Rush mode previously re-clicked Search every 3s while polling; that can abort a slow
-    in-flight AJAX and push first paint past the booking rush window.
-    """
+
+def _build_probe_schedule(total_ms: int, probes: list[int]) -> list[int]:
+    base = sorted({p for p in probes if p > 0})
+    if not base:
+        base = [max(500, total_ms // 3), max(1000, (total_ms * 2) // 3)]
+    schedule: list[int] = []
+    for p in base:
+        if p < total_ms:
+            schedule.append(p)
+    schedule.append(total_ms)
+    # Preserve ordering and de-dup after clamping.
+    final: list[int] = []
+    for p in schedule:
+        if p <= 0:
+            continue
+        if final and p == final[-1]:
+            continue
+        final.append(p)
+    return final
+
+
+def _percentile(values: list[float], p: float) -> float:
+    xs = sorted(values)
+    if not xs:
+        return 0.0
+    idx = int(round((p / 100.0) * (len(xs) - 1)))
+    idx = max(0, min(idx, len(xs) - 1))
+    return xs[idx]
+
+
+def _load_center_timetable_history_s(center_name: str, limit: int = 30) -> list[float]:
+    if not RUNTIME_LOG_PATH.exists():
+        return []
+    out: list[float] = []
+    target_step = f"timetable_load|{center_name}"
     try:
-        await tab.wait_for_function(
-            "() => document.querySelectorAll('table.tt-timetable').length >= 2",
-            timeout=timeout_ms,
-        )
-        return True
+        lines = RUNTIME_LOG_PATH.read_text(encoding="utf-8").splitlines()
     except Exception:
-        return False
+        return []
+    for line in reversed(lines):
+        if len(out) >= limit:
+            break
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        steps = row.get("rush_steps") or row.get("steps") or []
+        if not isinstance(steps, list):
+            continue
+        for st in steps:
+            if not isinstance(st, dict):
+                continue
+            if st.get("step") == target_step:
+                dur = st.get("duration_s")
+                if isinstance(dur, (int, float)) and dur > 0:
+                    out.append(float(dur))
+    return out
+
+
+def _derive_wait_budget_for_center(
+    center_name: str,
+    config: AppConfig,
+    *,
+    mode: str,
+) -> tuple[int, list[int]]:
+    if mode == "first":
+        default_total = int(config.settings.rush_timetable_first_wait_ms)
+    else:
+        default_total = int(config.settings.rush_timetable_retry_wait_ms)
+    total_ms = max(2_000, default_total)
+    probes = list(config.settings.rush_timetable_probe_ms)
+
+    history = _load_center_timetable_history_s(center_name)
+    if history:
+        p90_ms = _percentile(history, 90.0) * 1000.0
+        # Add buffer but cap to avoid over-waiting.
+        adaptive = int(min(max(p90_ms * 1.15, 3_000), 35_000))
+        if mode == "retry":
+            adaptive = int(max(2_500, adaptive * 0.7))
+        total_ms = adaptive
+
+    schedule = _build_probe_schedule(total_ms, probes)
+    return total_ms, schedule
+
+
+async def _probe_timetable_state(tab: Page) -> dict:
+    try:
+        return await tab.evaluate(
+            """() => {
+                const tables = document.querySelectorAll('table.tt-timetable');
+                const tableCount = tables.length;
+                const firstRows = tableCount >= 1 ? tables[0].querySelectorAll('tr').length : 0;
+                const secondRows = tableCount >= 2 ? tables[1].querySelectorAll('tr').length : 0;
+                const totalRows = firstRows + secondRows;
+                const hasGridLikeRows = totalRows >= 6;
+                return {
+                    table_count: tableCount,
+                    first_rows: firstRows,
+                    second_rows: secondRows,
+                    has_grid_like_rows: hasGridLikeRows
+                };
+            }"""
+        )
+    except Exception:
+        return {
+            "table_count": 0,
+            "first_rows": 0,
+            "second_rows": 0,
+            "has_grid_like_rows": False,
+        }
+
+
+async def _wait_for_rush_timetable_ready(
+    tab: Page,
+    *,
+    probe_schedule_ms: list[int],
+    reclick_guard_ms: int,
+    phase: str,
+) -> tuple[bool, dict]:
+    """Stage-based rush wait with guarded re-clicks and probe metrics."""
+    start = time.monotonic()
+    first_table_ms: float | None = None
+    two_tables_ms: float | None = None
+    reclick_count = 0
+    timeout_path = "none"
+    checkpoint_idx = 0
+    last_reclick_elapsed = -10_000.0
+    total_budget_ms = probe_schedule_ms[-1] if probe_schedule_ms else 0
+
+    while True:
+        elapsed_ms = (time.monotonic() - start) * 1000.0
+        state = await _probe_timetable_state(tab)
+        table_count = int(state.get("table_count", 0) or 0)
+
+        if table_count >= 1 and first_table_ms is None:
+            first_table_ms = elapsed_ms
+        if table_count >= 2 and bool(state.get("has_grid_like_rows")):
+            two_tables_ms = elapsed_ms
+            return True, {
+                "search_to_first_table_ms": round(first_table_ms or elapsed_ms, 1),
+                "search_to_two_tables_ms": round(two_tables_ms, 1),
+                "reclick_count": reclick_count,
+                "timeout_path": "none",
+                "phase": phase,
+            }
+
+        while checkpoint_idx < len(probe_schedule_ms) and elapsed_ms >= probe_schedule_ms[checkpoint_idx]:
+            # After the first short probe, allow guarded re-clicks at later checkpoints.
+            if checkpoint_idx >= 1 and (elapsed_ms - last_reclick_elapsed) >= reclick_guard_ms:
+                try:
+                    await tab.evaluate("document.getElementById('searchButton')?.click()")
+                    reclick_count += 1
+                    last_reclick_elapsed = elapsed_ms
+                except Exception:
+                    pass
+            checkpoint_idx += 1
+
+        if elapsed_ms >= total_budget_ms:
+            if first_table_ms is None:
+                timeout_path = f"{phase}_first_table_timeout"
+            else:
+                timeout_path = f"{phase}_two_tables_timeout"
+            break
+        await asyncio.sleep(0.08)
+
+    return False, {
+        "search_to_first_table_ms": round(first_table_ms, 1) if first_table_ms is not None else None,
+        "search_to_two_tables_ms": round(two_tables_ms, 1) if two_tables_ms is not None else None,
+        "reclick_count": reclick_count,
+        "timeout_path": timeout_path,
+        "phase": phase,
+    }
 
 
 async def _wait_for_timetable(page: Page, *, timeout_ms: int = 15_000, retries: int = 1) -> bool:
@@ -1266,26 +1435,54 @@ async def _async_wait_until(hour: int, minute: int, second: int = 0, *, pre_fire
     logger.info("Rush time reached: {}", datetime.now().strftime("%H:%M:%S.%f"))
 
 
-async def _warm_connections(center_tabs: list[tuple[str, Page]]) -> None:
+async def _warm_connections(center_tabs: list[tuple[str, Page]], mode: str = "head") -> None:
     """Warm TCP/TLS via lightweight fetch() — no page navigation, forms stay filled.
 
     Unlike the old approach (clicking Search then refilling), this sends a HEAD
     request from each tab's JS context.  The TCP + TLS handshake happens, but
     the page DOM is untouched, so we skip the expensive 2-3s refill step.
     """
-    warm_js = """async () => {
+    warm_js_head = """async () => {
         try {
             const r = await fetch(window.location.href, {
                 method: 'HEAD', credentials: 'same-origin', cache: 'no-store',
             });
-            return r.status;
-        } catch(e) { return 0; }
+            return {ok: true, status: r.status};
+        } catch(e) { return {ok: false, status: 0}; }
+    }"""
+    warm_js_mixed = """async () => {
+        const result = {headStatus: 0, getStatus: 0, staticProbe: 0};
+        try {
+            const h = await fetch(window.location.href, {
+                method: 'HEAD', credentials: 'same-origin', cache: 'no-store',
+            });
+            result.headStatus = h.status;
+        } catch (e) {}
+        try {
+            const g = await fetch(window.location.href, {
+                method: 'GET', credentials: 'same-origin', cache: 'no-store',
+            });
+            result.getStatus = g.status;
+            await g.text();
+        } catch (e) {}
+        try {
+            const link = document.querySelector('link[rel="stylesheet"]')?.href;
+            if (link) {
+                const s = await fetch(link, { method: 'GET', cache: 'no-store' });
+                result.staticProbe = s.status;
+            }
+        } catch (e) {}
+        return result;
     }"""
 
     async def _warm_one(center_name: str, tab: Page) -> None:
         try:
-            status = await tab.evaluate(warm_js)
-            logger.debug("Connection warmed for {} (HTTP {})", center_name, status)
+            if mode == "mixed":
+                status = await tab.evaluate(warm_js_mixed)
+                logger.debug("Connection warmed for {} (mixed={})", center_name, status)
+            else:
+                status = await tab.evaluate(warm_js_head)
+                logger.debug("Connection warmed for {} (HEAD={})", center_name, status)
         except Exception as exc:
             logger.debug("Warm-up for {} failed (ok): {}", center_name, exc)
 
@@ -1321,7 +1518,12 @@ async def _retry_same_slot_lane(
 
         try:
             await tab.evaluate("document.getElementById('searchButton')?.click()")
-            await _wait_for_rush_timetable_ready(tab, timeout_ms=1_500)
+            await _wait_for_rush_timetable_ready(
+                tab,
+                probe_schedule_ms=[500, 1500],
+                reclick_guard_ms=max(300, config.settings.rush_reclick_guard_ms // 2),
+                phase="conflict_retry",
+            )
         except Exception:
             logger.debug("Conflict retry: search re-fire failed for {}", center_name)
 
@@ -1455,7 +1657,7 @@ async def _run_booking_rush(
         await asyncio.sleep(sleep_before_warm)
 
         with tracker.step("warm_connections"):
-            await _warm_connections(center_tabs)
+            await _warm_connections(center_tabs, mode=config.settings.rush_warmup_mode)
 
         await _async_wait_until(*rush_time, pre_fire_ms=pre_fire_ms)
     else:
@@ -1471,40 +1673,114 @@ async def _run_booking_rush(
     tracker.set_metric("submit_attempt_count", 0)
     tracker.set_metric("conflict_retries", 0)
     tracker.set_metric("late_success_wave", -1)
+    tracker.set_metric("reclick_count", 0)
+    tracker.set_metric("early_scan_attempt_count", 0)
+    tracker.set_metric("early_scan_hit_count", 0)
 
-    # ── Phase 3+4: Fire search; one long wait (no rapid re-clicks that abort slow AJAX) ──
-    first_wait = config.settings.rush_timetable_first_wait_ms
-    retry_wait = config.settings.rush_timetable_retry_wait_ms
+    # ── Phase 3+4: Fire search with staged probes + guarded re-clicks ──
+    global_reclick_count = 0
 
     async def _fire_and_scan(
         center_name: str, tab: Page,
     ) -> tuple[str, Page, dict[date, List[TimeSlot]], float, float]:
+        nonlocal global_reclick_count
         t_search = time.monotonic()
         await tab.evaluate("document.getElementById('searchButton')?.click()")
         logger.info("Search fired: {}", center_name)
 
-        found = await _wait_for_rush_timetable_ready(tab, first_wait)
-        if not found:
-            logger.debug(
-                "{}: timetable not ready after {}ms, single re-click …",
-                center_name, first_wait,
+        first_budget_ms, first_schedule = _derive_wait_budget_for_center(
+            center_name,
+            config,
+            mode="first",
+        )
+        retry_budget_ms, retry_schedule = _derive_wait_budget_for_center(
+            center_name,
+            config,
+            mode="retry",
+        )
+        center_key = _metric_center_key(center_name)
+        tracker.set_metric(f"first_wait_budget_ms|{center_key}", first_budget_ms)
+        tracker.set_metric(f"retry_wait_budget_ms|{center_key}", retry_budget_ms)
+
+        found, first_probe = await _wait_for_rush_timetable_ready(
+            tab,
+            probe_schedule_ms=first_schedule,
+            reclick_guard_ms=config.settings.rush_reclick_guard_ms,
+            phase="first",
+        )
+        global_reclick_count += int(first_probe.get("reclick_count", 0) or 0)
+        tracker.set_metric("reclick_count", global_reclick_count)
+
+        first_table_ms = first_probe.get("search_to_first_table_ms")
+        if isinstance(first_table_ms, (int, float)):
+            tracker.set_metric(
+                f"search_to_first_table_ms|{center_key}",
+                first_table_ms,
             )
-            try:
-                await tab.evaluate("document.getElementById('searchButton')?.click()")
-            except Exception:
-                pass
-            found = await _wait_for_rush_timetable_ready(tab, retry_wait)
+
+        early_scan: dict[date, List[TimeSlot]] = {}
+        early_hit = False
+        if isinstance(first_table_ms, (int, float)):
+            tracker.incr_metric("early_scan_attempt_count")
+            early_scan = await scan_available_slots_multi(
+                tab, config, targets=target_dates, center_name=center_name,
+            )
+            early_hit = any(bool(v) for v in early_scan.values())
+            if early_hit:
+                tracker.incr_metric("early_scan_hit_count")
+
+        if not found and not early_hit:
+            found, retry_probe = await _wait_for_rush_timetable_ready(
+                tab,
+                probe_schedule_ms=retry_schedule,
+                reclick_guard_ms=config.settings.rush_reclick_guard_ms,
+                phase="retry",
+            )
+            global_reclick_count += int(retry_probe.get("reclick_count", 0) or 0)
+            tracker.set_metric("reclick_count", global_reclick_count)
+            timeout_path = retry_probe.get("timeout_path")
+            if isinstance(timeout_path, str) and timeout_path != "none":
+                tracker.set_metric(f"timeout_path|{center_key}", timeout_path)
+
+            two_ms = retry_probe.get("search_to_two_tables_ms")
+            if isinstance(two_ms, (int, float)):
+                tracker.set_metric(
+                    f"search_to_two_tables_ms|{center_key}",
+                    two_ms,
+                )
+        else:
+            timeout_path = first_probe.get("timeout_path")
+            if isinstance(timeout_path, str) and timeout_path != "none":
+                tracker.set_metric(f"timeout_path|{center_key}", timeout_path)
+
+            two_ms = first_probe.get("search_to_two_tables_ms")
+            if isinstance(two_ms, (int, float)):
+                tracker.set_metric(
+                    f"search_to_two_tables_ms|{center_key}",
+                    two_ms,
+                )
 
         t_timetable_loaded = time.monotonic()
         load_dur = t_timetable_loaded - t_search
 
-        if not found:
-            logger.warning("{}: timetable never loaded after {:.1f}s", center_name, load_dur)
+        if not found and not early_hit:
+            logger.warning(
+                "{}: timetable never reached ready state after {:.1f}s "
+                "(first_budget={}ms, retry_budget={}ms)",
+                center_name,
+                load_dur,
+                first_budget_ms,
+                retry_budget_ms,
+            )
 
         t_scan_start = time.monotonic()
         result = await scan_available_slots_multi(
             tab, config, targets=target_dates, center_name=center_name,
         )
+        if early_scan:
+            for d, slots in early_scan.items():
+                if slots and not result.get(d):
+                    result[d] = slots
         scan_dur = time.monotonic() - t_scan_start
 
         tracker.record_step(f"timetable_load|{center_name}", load_dur)

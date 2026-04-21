@@ -18,6 +18,10 @@ class AnalysisSummary:
     visible_slots_unbooked_rate: float
     p90_refresh_to_candidate_ms: float | None
     p90_candidate_to_submit_ms: float | None
+    timetable_load_p50_s: float | None
+    timetable_load_p90_s: float | None
+    timetable_load_p99_s: float | None
+    timetable_load_gt_8s_rate: float
     reason_counts: Counter[str]
 
 
@@ -51,6 +55,15 @@ def _p90(values: list[float]) -> float | None:
     xs = sorted(values)
     idx = int(round(0.9 * (len(xs) - 1)))
     return round(xs[idx], 1)
+
+
+def _percentile(values: list[float], p: float) -> float | None:
+    if not values:
+        return None
+    xs = sorted(values)
+    idx = int(round((p / 100.0) * (len(xs) - 1)))
+    idx = max(0, min(idx, len(xs) - 1))
+    return round(xs[idx], 3)
 
 
 def _window_filter(rows: list[dict[str, Any]], days: int) -> list[dict[str, Any]]:
@@ -99,16 +112,31 @@ def summarize(runtime_rows: list[dict[str, Any]], feedback_rows: list[dict[str, 
 
     refresh_to_candidate_vals: list[float] = []
     candidate_to_submit_vals: list[float] = []
+    timetable_load_vals_s: list[float] = []
     for row in runtime_rows:
         metrics = row.get("metrics") or {}
         if not isinstance(metrics, dict):
-            continue
+            metrics = {}
         r1 = metrics.get("refresh_to_first_candidate_ms")
         r2 = metrics.get("first_candidate_to_submit_ms")
         if isinstance(r1, (int, float)):
             refresh_to_candidate_vals.append(float(r1))
         if isinstance(r2, (int, float)):
             candidate_to_submit_vals.append(float(r2))
+
+        rush_steps = row.get("rush_steps") or row.get("steps") or []
+        if isinstance(rush_steps, list):
+            for st in rush_steps:
+                if not isinstance(st, dict):
+                    continue
+                step_name = str(st.get("step", ""))
+                if step_name.startswith("timetable_load|"):
+                    dur = st.get("duration_s")
+                    if isinstance(dur, (int, float)) and dur > 0:
+                        timetable_load_vals_s.append(float(dur))
+
+    gt8 = sum(1 for v in timetable_load_vals_s if v > 8.0)
+    gt8_rate = (gt8 / len(timetable_load_vals_s) * 100.0) if timetable_load_vals_s else 0.0
 
     return AnalysisSummary(
         runs=runs,
@@ -119,6 +147,10 @@ def summarize(runtime_rows: list[dict[str, Any]], feedback_rows: list[dict[str, 
         visible_slots_unbooked_rate=round(visible_slots_unbooked_rate, 1),
         p90_refresh_to_candidate_ms=_p90(refresh_to_candidate_vals),
         p90_candidate_to_submit_ms=_p90(candidate_to_submit_vals),
+        timetable_load_p50_s=_percentile(timetable_load_vals_s, 50.0),
+        timetable_load_p90_s=_percentile(timetable_load_vals_s, 90.0),
+        timetable_load_p99_s=_percentile(timetable_load_vals_s, 99.0),
+        timetable_load_gt_8s_rate=round(gt8_rate, 1),
         reason_counts=reason_counts,
     )
 
@@ -156,6 +188,8 @@ def analyze_logs(
                 f"\nPrevious {compare_days}d: runs={prev.runs}, success_rate={prev.success_rate:.1f}%"
                 f", technical_fail_rate={prev.technical_fail_rate:.1f}%,"
                 f" visible_slots_unbooked_rate={prev.visible_slots_unbooked_rate:.1f}%"
+                f", timetable_load_p90={prev.timetable_load_p90_s if prev.timetable_load_p90_s is not None else 'n/a'}s"
+                f", timetable_load_gt8s={prev.timetable_load_gt_8s_rate:.1f}%"
                 f", delta_success_rate={delta:+.1f}pp"
             )
 
@@ -171,6 +205,9 @@ def analyze_logs(
         f"{current.p90_candidate_to_submit_ms:.1f}ms"
         if current.p90_candidate_to_submit_ms is not None else "n/a"
     )
+    p50_load = f"{current.timetable_load_p50_s:.3f}s" if current.timetable_load_p50_s is not None else "n/a"
+    p90_load = f"{current.timetable_load_p90_s:.3f}s" if current.timetable_load_p90_s is not None else "n/a"
+    p99_load = f"{current.timetable_load_p99_s:.3f}s" if current.timetable_load_p99_s is not None else "n/a"
 
     return (
         f"Window: last {days}d\n"
@@ -180,6 +217,8 @@ def analyze_logs(
         f"Visible-slots-unbooked rate: {current.visible_slots_unbooked_rate:.1f}%\n"
         f"P90 refresh_to_first_candidate_ms: {p90_refresh}\n"
         f"P90 first_candidate_to_submit_ms: {p90_submit}\n"
+        f"Timetable load P50/P90/P99: {p50_load} / {p90_load} / {p99_load}\n"
+        f"Timetable load >8s rate: {current.timetable_load_gt_8s_rate:.1f}%\n"
         f"Top failure reasons: {top_reasons}"
         f"{prev_text}\n"
     )

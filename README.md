@@ -113,7 +113,7 @@ Or manually add to crontab:
 - Use `--debug` to watch the browser in real-time
 - Use `--dry-run` to see slot selection without booking
 - Use `--analyze-logs --days 14 --compare-days 14` to track success-rate delta,
-  technical failures, and rush latency P90 metrics
+  technical failures, timetable load P50/P90/P99, and slow-load (`>8s`) ratio
 
 ## Project Structure
 

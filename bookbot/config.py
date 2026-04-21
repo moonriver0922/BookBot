@@ -34,6 +34,9 @@ DEFAULTS = {
         "rush_pre_fire_ms": 0,
         "rush_timetable_first_wait_ms": 24000,
         "rush_timetable_retry_wait_ms": 16000,
+        "rush_timetable_probe_ms": [1200, 3200, 6800],
+        "rush_reclick_guard_ms": 1400,
+        "rush_warmup_mode": "mixed",
         "rush_retry_offsets_s": [3, 8],
         "same_slot_retry_limit": 3,
         "same_slot_retry_budget_ms": 3000,
@@ -89,6 +92,9 @@ class Settings:
     rush_pre_fire_ms: int = 0
     rush_timetable_first_wait_ms: int = 24000
     rush_timetable_retry_wait_ms: int = 16000
+    rush_timetable_probe_ms: List[int] = field(default_factory=lambda: [1200, 3200, 6800])
+    rush_reclick_guard_ms: int = 1400
+    rush_warmup_mode: str = "mixed"
     rush_retry_offsets_s: List[int] = field(default_factory=lambda: [3, 8])
     same_slot_retry_limit: int = 3
     same_slot_retry_budget_ms: int = 3000
