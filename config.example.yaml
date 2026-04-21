@@ -33,6 +33,10 @@ settings:
   same_slot_retry_limit: 3        # Conflict retry attempts for the same slot
   same_slot_retry_budget_ms: 3000 # Total budget for same-slot conflict retries
   next_click_backoff_ms: [150, 300, 500]  # Next button short retries before fallback
+  booking_mode: "ui"             # ui | hybrid | api
+  rush_time_sync_enabled: true   # Align local trigger with server Date header
+  rush_time_sync_samples: 5      # Number of probes for median delta
+  rush_time_sync_timeout_ms: 1500
 
 stealth:
   human_delay_min: 0.3            # Min seconds between actions
@@ -40,3 +44,21 @@ stealth:
   typing_delay_min: 50            # Min ms per keystroke
   typing_delay_max: 150           # Max ms per keystroke
   use_real_chrome: true           # Use installed Chrome instead of Chromium
+
+selectors:
+  search_date: "#searchDate"
+  activity: "#actvId"
+  center: "#ctrId"
+  search_button: "#searchButton"
+  next_button: "#nextButton"
+  timetable: "table.tt-timetable"
+  sports_facility_button: 'a:has-text("Sports Facility"), button:has-text("Sports Facility")'
+  unavailable_class_markers: ["not-avail", "unavail", "closed"]
+
+api:
+  enabled: false
+  base_url: "https://www40.polyu.edu.hk"
+  search_endpoint: ""            # e.g. /starspossfbstud/secure/api/search
+  submit_endpoint: ""            # e.g. /starspossfbstud/secure/api/submit
+  request_timeout_ms: 2500
+  retry_count: 2

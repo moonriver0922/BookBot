@@ -74,6 +74,14 @@ def parse_args() -> argparse.Namespace:
         help="Verbose logging",
     )
 
+    rollout_p = sub.add_parser("rollout-report", help="Summarize rollout metrics by booking mode")
+    rollout_p.add_argument("--days", type=int, default=14, help="Window size in days")
+    rollout_p.add_argument(
+        "--debug",
+        action="store_true",
+        help="Verbose logging",
+    )
+
     plan_p = sub.add_parser("plan", help="Call Cursor Agent for plan-style log analysis")
     plan_p.add_argument("--days", type=int, default=14, help="Window size in days")
     plan_p.add_argument(
@@ -197,6 +205,13 @@ def main() -> None:
             days=args.days,
             compare_days=args.compare_days,
         )
+        logger.info("\n{}", report.rstrip())
+        return
+
+    if args.command == "rollout-report":
+        from bookbot.rollout import summarize_rollout
+
+        report = summarize_rollout(Path("logs/runtime.jsonl"), days=args.days)
         logger.info("\n{}", report.rstrip())
         return
 
