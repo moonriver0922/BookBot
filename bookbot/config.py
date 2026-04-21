@@ -11,6 +11,10 @@ CONFIG_SEARCH_PATHS = [
     Path("config.yaml"),
     Path(__file__).resolve().parent.parent / "config.yaml",
 ]
+AUTO_TUNING_SEARCH_PATHS = [
+    Path("auto_tuning.yaml"),
+    Path(__file__).resolve().parent.parent / "auto_tuning.yaml",
+]
 
 DEFAULTS = {
     "preferences": {
@@ -162,6 +166,13 @@ def load_config(path: str | None = None) -> AppConfig:
         raw = yaml.safe_load(f) or {}
 
     merged = _deep_merge(DEFAULTS, raw)
+    for tuning_path in AUTO_TUNING_SEARCH_PATHS:
+        if tuning_path.is_file():
+            with open(tuning_path, "r", encoding="utf-8") as tf:
+                tuning_raw = yaml.safe_load(tf) or {}
+            if isinstance(tuning_raw, dict):
+                merged = _deep_merge(merged, tuning_raw)
+            break
 
     creds = merged.get("credentials", {})
     prefs = merged.get("preferences", {})

@@ -79,10 +79,46 @@ def parse_args() -> argparse.Namespace:
     plan_p.add_argument(
         "--agent-model",
         type=str,
-        default="codex5.3",
-        help="Model passed to cursor-agent (default: codex5.3)",
+        default="gpt-5.3-codex",
+        help="Model passed to cursor-agent (default: gpt-5.3-codex)",
     )
     plan_p.add_argument(
+        "--debug",
+        action="store_true",
+        help="Verbose logging",
+    )
+
+    review_p = sub.add_parser("review", help="Daily runtime/feedback review with auto-optimization")
+    review_p.add_argument("--days", type=int, default=14, help="Historical window size in days")
+    review_p.add_argument(
+        "--auto-fix",
+        action="store_true",
+        help="Apply automatic optimization actions when today's run failed",
+    )
+    review_p.add_argument(
+        "--max-auto-actions",
+        type=int,
+        default=3,
+        help="Maximum automatic optimization actions in one review run",
+    )
+    review_p.add_argument(
+        "--without-agent",
+        action="store_true",
+        help="Disable Cursor Agent analysis during failed-review diagnosis",
+    )
+    review_p.add_argument(
+        "--agent-model",
+        type=str,
+        default="gpt-5.3-codex",
+        help="Model passed to Cursor Agent for failed-review diagnosis",
+    )
+    review_p.add_argument(
+        "--agent-timeout-s",
+        type=int,
+        default=120,
+        help="Timeout seconds for Cursor Agent analysis invocation",
+    )
+    review_p.add_argument(
         "--debug",
         action="store_true",
         help="Verbose logging",
@@ -91,7 +127,7 @@ def parse_args() -> argparse.Namespace:
     schedule_p = sub.add_parser("schedule", help="Manage schedule")
     schedule_p.add_argument(
         "action",
-        choices=["install"],
+        choices=["install", "install-review", "install-all"],
         help="Schedule action",
     )
     schedule_p.add_argument(
@@ -110,7 +146,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--agent-plan-logs", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--days", type=int, default=14, help=argparse.SUPPRESS)
     parser.add_argument("--compare-days", type=int, default=14, help=argparse.SUPPRESS)
-    parser.add_argument("--agent-model", type=str, default="codex5.3", help=argparse.SUPPRESS)
+    parser.add_argument("--agent-model", type=str, default="gpt-5.3-codex", help=argparse.SUPPRESS)
+    parser.add_argument("--auto-fix", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--max-auto-actions", type=int, default=3, help=argparse.SUPPRESS)
+    parser.add_argument("--without-agent", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--agent-timeout-s", type=int, default=120, help=argparse.SUPPRESS)
 
     args = parser.parse_args()
 
@@ -138,9 +178,14 @@ def main() -> None:
     os.chdir(project_dir)
 
     if args.command == "schedule":
-        from bookbot.scheduler import install_schedule
+        from bookbot.scheduler import install_schedule, install_review_schedule
         if args.action == "install":
             install_schedule()
+        elif args.action == "install-review":
+            install_review_schedule()
+        elif args.action == "install-all":
+            install_schedule()
+            install_review_schedule()
         return
 
     if args.command == "analyze":
@@ -167,6 +212,23 @@ def main() -> None:
         )
         if rc != 0:
             logger.error("Agent plan analysis failed with exit code {}", rc)
+            sys.exit(rc)
+        return
+
+    if args.command == "review":
+        from bookbot.review import run_daily_review
+
+        rc = run_daily_review(
+            runtime_path=Path("logs/runtime.jsonl"),
+            feedback_path=Path("logs/feedback.jsonl"),
+            days=args.days,
+            auto_fix=args.auto_fix,
+            max_auto_actions=max(1, args.max_auto_actions),
+            with_agent=not args.without_agent,
+            agent_model=args.agent_model,
+            agent_timeout_s=max(15, args.agent_timeout_s),
+        )
+        if rc != 0:
             sys.exit(rc)
         return
 
