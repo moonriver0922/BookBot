@@ -58,7 +58,8 @@ selectors:
 api:
   enabled: false
   base_url: "https://www40.polyu.edu.hk"
-  search_endpoint: ""            # e.g. /starspossfbstud/secure/api/search
-  submit_endpoint: ""            # e.g. /starspossfbstud/secure/api/submit
+  search_endpoint: "/starspossfbstud/secure/ui_make_book/timetable.json"
+  prepare_endpoint: "/starspossfbstud/secure/ui_make_book/make_book.do"
+  submit_endpoint: "/starspossfbstud/secure/ui_make_book/make_book_submit.do"
   request_timeout_ms: 2500
   retry_count: 2

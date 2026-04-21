@@ -13,7 +13,12 @@ from typing import TYPE_CHECKING, List, Tuple
 
 from loguru import logger
 
-from bookbot.api_client import BookingApiClient, build_api_session_bridge
+from bookbot.api_client import (
+    ApiCallResult,
+    BookingApiClient,
+    build_api_session_bridge,
+    extract_form_fields_from_html,
+)
 from bookbot.stealth import human_click, human_delay, save_debug_snapshot
 from bookbot.tracker import tracker
 
@@ -1713,44 +1718,271 @@ async def _retry_same_slot_lane(
     return []
 
 
-def _slots_from_api_payload(payload: dict | None, center_name: str) -> list[TimeSlot]:
-    if not isinstance(payload, dict):
-        return []
-    rows = payload.get("slots") or payload.get("data") or payload.get("results") or []
-    if not isinstance(rows, list):
-        return []
-    out: list[TimeSlot] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        start = str(row.get("start") or row.get("startTime") or "").strip()
-        end = str(row.get("end") or row.get("endTime") or "").strip()
-        available = row.get("available")
-        if not start or not end:
-            continue
-        if available is False:
-            continue
-        out.append(
-            TimeSlot(
-                start=start,
-                end=end,
-                center=center_name,
-                court=str(row.get("court") or row.get("courtName") or ""),
-                available=True,
-            )
-        )
-    return out
+def _format_target_date_display(target: date) -> str:
+    return target.strftime("%d %b %Y")
 
 
-def _api_submit_success(payload: dict | None, text: str) -> bool:
-    if isinstance(payload, dict):
-        if payload.get("success") is True:
-            return True
-        status = str(payload.get("status") or "").lower()
-        if status in {"ok", "success", "booked", "confirmed"}:
-            return True
+async def _extract_booking_form_state(page: Page, config: AppConfig) -> dict[str, str]:
+    center_id = _selector_id(config.selectors.center)
+    activity_id = _selector_id(config.selectors.activity)
+    return await page.evaluate(
+        """({ centerId, activityId }) => {
+            const val = (sel) => document.querySelector(sel)?.value || "";
+            const centerEl = document.getElementById(centerId);
+            const actvEl = document.getElementById(activityId);
+            const centerText = centerEl?.selectedOptions?.[0]?.text?.trim() || "";
+            return {
+                csrf_token: val('input[name="CSRFToken"], input[name="csrfToken"]'),
+                fb_user_id: val('input[name="fbUserId"]'),
+                data_set_id: val('input[name="dataSetId"]'),
+                actv_id: actvEl?.value || val('input[name="actvId"]'),
+                center_id: centerEl?.value || "",
+                center_name: centerText,
+                book_type: val('input[name="bookType"]') || "INDV",
+            };
+        }""",
+        {"centerId": center_id, "activityId": activity_id},
+    )
+
+
+async def _extract_slot_protocol_meta(
+    page: Page,
+    slot: TimeSlot,
+    target: date,
+    config: AppConfig,
+) -> dict[str, str]:
+    target_day = target.strftime("%d %b")
+    table_selector = config.selectors.timetable
+    center_id = _selector_id(config.selectors.center)
+    return await page.evaluate(
+        """({ targetDay, startTime, endTime, tableSelector, centerId }) => {
+            const out = {
+                facility_id: "",
+                facility_name: "",
+                center_id: "",
+                center_name: "",
+            };
+            const centerEl = document.getElementById(centerId);
+            out.center_id = centerEl?.value || "";
+            out.center_name = centerEl?.selectedOptions?.[0]?.text?.trim() || "";
+
+            const tables = document.querySelectorAll(tableSelector);
+            if (tables.length < 2) return out;
+
+            let timeTable = null, dateTable = null;
+            for (const t of tables) {
+                const firstRowText = t.querySelector('tr')?.innerText?.trim() || '';
+                if (/\\d{1,2}\\s+\\w{3}/.test(firstRowText)) dateTable = t;
+                else timeTable = t;
+            }
+            if (!timeTable || !dateTable) return out;
+
+            const headers = dateTable.querySelectorAll('tr')[0]?.querySelectorAll('td, th') || [];
+            let colIdx = -1;
+            for (let i = 0; i < headers.length; i++) {
+                if (headers[i].innerText.trim().includes(targetDay)) { colIdx = i; break; }
+            }
+            if (colIdx < 0) return out;
+
+            const timeRows = timeTable.querySelectorAll('tr');
+            const timeRe = /(\\d{1,2}:\\d{2})\\s*[-–\\n]\\s*(\\d{1,2}:\\d{2})/;
+            let rowIdx = -1;
+            for (let r = 1; r < timeRows.length; r++) {
+                const m = timeRows[r].innerText.trim().match(timeRe);
+                if (m && m[1] === startTime && m[2] === endTime) { rowIdx = r; break; }
+            }
+            if (rowIdx < 0) return out;
+
+            const dataRow = dateTable.querySelectorAll('tr')[rowIdx];
+            const cell = dataRow?.querySelectorAll('td')?.[colIdx];
+            if (!cell) return out;
+
+            const onclickRaw = cell.getAttribute('onclick')
+                || cell.querySelector('[onclick]')?.getAttribute('onclick')
+                || "";
+            const html = cell.innerHTML || "";
+            const text = cell.textContent?.trim() || "";
+            out.facility_name = text || cell.getAttribute('title') || "";
+
+            const dataId = cell.getAttribute('data-facility-id')
+                || cell.querySelector('[data-facility-id]')?.getAttribute('data-facility-id')
+                || "";
+            let facilityId = dataId;
+            if (!facilityId) {
+                let m = onclickRaw.match(/facilityId\\s*[=:]\\s*['"]?(\\d+)/i);
+                if (!m) m = onclickRaw.match(/['",\\s](\\d{2,})['",\\s]/);
+                if (!m) m = html.match(/facilityId\\s*[=:]\\s*['"]?(\\d+)/i);
+                if (m) facilityId = m[1];
+            }
+            out.facility_id = facilityId || "";
+            return out;
+        }""",
+        {
+            "targetDay": target_day,
+            "startTime": slot.start,
+            "endTime": slot.end,
+            "tableSelector": table_selector,
+            "centerId": center_id,
+        },
+    )
+
+
+def _build_search_payload_from_state(state: dict[str, str], target: date) -> dict[str, str]:
+    return {
+        "CSRFToken": state.get("csrf_token", ""),
+        "fbUserId": state.get("fb_user_id", ""),
+        "bookType": state.get("book_type", "INDV") or "INDV",
+        "dataSetId": state.get("data_set_id", ""),
+        "actvId": state.get("actv_id", ""),
+        "searchDate": _format_target_date_display(target),
+        "ctrId": state.get("center_id", ""),
+        "facilityId": "",
+        "showCourtAreaDetails": "true",
+    }
+
+
+def _build_prepare_payload(
+    *,
+    state: dict[str, str],
+    slot_meta: dict[str, str],
+    slot: TimeSlot,
+    target: date,
+) -> dict[str, str]:
+    search_form = (
+        f"fbUserId={state.get('fb_user_id', '')}"
+        f"&bookType={state.get('book_type', 'INDV') or 'INDV'}"
+        f"&dataSetId={state.get('data_set_id', '')}"
+        f"&actvId={state.get('actv_id', '')}"
+        f"&searchDate={_format_target_date_display(target)}"
+        f"&ctrId={slot_meta.get('center_id') or state.get('center_id', '')}"
+        f"&facilityId="
+    )
+    start_date_time = f"{_format_target_date_display(target)} {slot.start}"
+    end_date_time = f"{_format_target_date_display(target)} {slot.end}"
+    center_id = slot_meta.get("center_id") or state.get("center_id", "")
+    facility_id = slot_meta.get("facility_id", "")
+    return {
+        "brcdNo": "",
+        "phone": "",
+        "extlPtyDclrId": "",
+        "dataSetId": state.get("data_set_id", ""),
+        "actvId": state.get("actv_id", ""),
+        "onBehalfOfFbUserId": "",
+        "byPassQuota": "false",
+        "byPassChrgSchm": "false",
+        "byPassBookingDaysLimit": "false",
+        "repeatOccurrence": "false",
+        "grpFacilityIds": "",
+        "searchFormString": search_form,
+        "boMakeBookFacilities[0].ctrId": center_id,
+        "boMakeBookFacilities[0].facilityId": facility_id,
+        "boMakeBookFacilities[0].startDateTime": start_date_time,
+        "boMakeBookFacilities[0].endDateTime": end_date_time,
+        "CSRFToken": state.get("csrf_token", ""),
+    }
+
+
+def _classify_api_submit_outcome(text: str, final_url: str = "") -> tuple[bool, str]:
     txt = text.lower()
-    return any(word in txt for word in ("success", "booked", "confirmed"))
+    url = final_url.lower()
+
+    if any(m in txt for m in BOOKING_CONFLICT_MARKERS):
+        return False, "slot_conflict"
+    if "csrf" in txt and any(k in txt for k in ("invalid", "expired", "mismatch", "token")):
+        return False, "csrf_expired"
+    if "declare" in txt and any(k in txt for k in ("required", "must", "agree", "accept")):
+        return False, "declare_missing"
+    if any(k in txt for k in ("quota", "limit reached", "booking days limit", "exceed")):
+        return False, "quota_limit"
+    if any(k in txt for k in ("under maintenance", "we'll be back soon", "temporarily unavailable")):
+        return False, "maintenance"
+
+    success_markers = (
+        "booking confirmed",
+        "booking successful",
+        "booked successfully",
+        "booking result",
+        "booking no",
+        "reservation no",
+        "reference no",
+    )
+    if any(marker in txt for marker in success_markers):
+        return True, "success_marker"
+    if "make_book_result.do" in url and "error" not in txt and "failed" not in txt:
+        return True, "result_page"
+    return False, "submit_unknown"
+
+
+def _classify_api_error(phase: str, result: ApiCallResult) -> str:
+    haystack = f"{result.error} {result.text}".lower()
+    if "missing_facility_id" in haystack or "facility_id_not_found" in haystack:
+        return "missing_facility_id"
+    if "submit_form_fields_not_found" in haystack:
+        return "submit_form_missing_fields"
+    if "csrf" in haystack and any(k in haystack for k in ("invalid", "expired", "mismatch", "token")):
+        return "csrf_expired"
+    if "declare" in haystack and any(k in haystack for k in ("required", "must", "agree", "accept")):
+        return "declare_missing"
+    if any(m in haystack for m in BOOKING_CONFLICT_MARKERS):
+        return "slot_conflict"
+    if any(k in haystack for k in ("quota", "limit reached", "booking days limit", "exceed")):
+        return "quota_limit"
+    if any(k in haystack for k in ("timeout", "timed out")):
+        return f"{phase}_timeout"
+    if result.status_code in {401, 403}:
+        return "auth_required"
+    if result.status_code in {429}:
+        return "rate_limited"
+    if result.status_code >= 500:
+        return "server_error"
+    if result.status_code == 0:
+        return "network_error"
+    return f"{phase}_failed"
+
+
+def _record_api_failure(reason: str, *, center: str, target: date, detail: str = "") -> None:
+    tracker.incr_metric(f"api_fail_reason|{reason}")
+    tracker.add_feedback(
+        "api_step_failed",
+        reason_detail=reason,
+        center=center,
+        date=str(target),
+        detail=detail[:300],
+    )
+
+
+async def _submit_booking_via_protocol(
+    page: Page,
+    client: BookingApiClient,
+    *,
+    state: dict[str, str],
+    target: date,
+    slot: TimeSlot,
+    config: AppConfig,
+) -> ApiCallResult:
+    slot_meta = await _extract_slot_protocol_meta(page, slot, target, config)
+    if not slot_meta.get("facility_id"):
+        return ApiCallResult(ok=False, status_code=0, error="missing_facility_id")
+
+    prepare_payload = _build_prepare_payload(
+        state=state,
+        slot_meta=slot_meta,
+        slot=slot,
+        target=target,
+    )
+    prepare_res = await client.prepare_submit(prepare_payload)
+    if not prepare_res.ok:
+        return prepare_res
+
+    submit_fields = extract_form_fields_from_html(prepare_res.text)
+    if not submit_fields:
+        return ApiCallResult(ok=False, status_code=0, error="submit_form_fields_not_found")
+    if "declare" not in submit_fields:
+        tracker.incr_metric("api_warning|declare_not_present_in_form")
+    submit_fields["declare"] = "on"
+    if state.get("csrf_token"):
+        submit_fields["CSRFToken"] = state["csrf_token"]
+    return await client.submit(submit_fields)
 
 
 async def _run_booking_api_first(
@@ -1786,19 +2018,59 @@ async def _run_booking_api_first(
 
     for center_name in center_order:
         for target in target_dates:
-            search_payload = {
-                "date": target.strftime("%Y-%m-%d"),
-                "activity": config.preferences.activity,
-                "center": center_name,
-            }
+            try:
+                await select_booking_criteria(
+                    page,
+                    target,
+                    config,
+                    center_override=center_name,
+                    auto_search=False,
+                    rush=True,
+                )
+            except Exception as exc:
+                _record_api_failure(
+                    "select_criteria_failed",
+                    center=center_name,
+                    target=target,
+                    detail=str(exc),
+                )
+                continue
+
+            state = await _extract_booking_form_state(page, config)
+            csrf_token = state.get("csrf_token", "")
+            if not csrf_token:
+                _record_api_failure(
+                    "csrf_expired",
+                    center=center_name,
+                    target=target,
+                    detail="csrf token missing on booking form",
+                )
+                continue
+
+            search_payload = _build_search_payload_from_state(state, target)
             with tracker.step(f"api_search|{center_name}|{target}"):
-                search_res = await client.search(search_payload)
+                search_res = await client.search(csrf_token=csrf_token, payload=search_payload)
             tracker.incr_metric("api_search_attempt_count")
             if not search_res.ok:
                 tracker.incr_metric("api_search_fail_count")
+                reason = _classify_api_error("search", search_res)
+                _record_api_failure(
+                    reason,
+                    center=center_name,
+                    target=target,
+                    detail=f"status={search_res.status_code} error={search_res.error}",
+                )
                 continue
 
-            slots = _slots_from_api_payload(search_res.payload, center_name)
+            await _click_search_raw(page, config)
+            await _wait_for_timetable(page, config, timeout_ms=8_000, retries=0)
+            slots = await scan_available_slots(
+                page,
+                config,
+                target=target,
+                center_name=center_name,
+                rush=True,
+            )
             best = find_best_booking(slots, config.preferences.weekly_max_slots, config)
             if not best:
                 continue
@@ -1813,28 +2085,46 @@ async def _run_booking_api_first(
                 return True
 
             slot = best[0]
-            submit_payload = {
-                "date": target.strftime("%Y-%m-%d"),
-                "activity": config.preferences.activity,
-                "center": center_name,
-                "slot": {
-                    "start": slot.start,
-                    "end": slot.end,
-                },
-            }
             with tracker.step(f"api_submit|{center_name}|{target}"):
-                submit_res = await client.submit(submit_payload)
+                submit_res = await _submit_booking_via_protocol(
+                    page,
+                    client,
+                    state=state,
+                    target=target,
+                    slot=slot,
+                    config=config,
+                )
             tracker.incr_metric("api_submit_attempt_count")
-            if submit_res.ok and _api_submit_success(submit_res.payload, submit_res.text):
+            if not submit_res.ok:
+                tracker.incr_metric("api_submit_fail_count")
+                reason = _classify_api_error("submit", submit_res)
+                _record_api_failure(
+                    reason,
+                    center=center_name,
+                    target=target,
+                    detail=f"status={submit_res.status_code} error={submit_res.error}",
+                )
+                continue
+
+            success, outcome = _classify_api_submit_outcome(submit_res.text, submit_res.final_url)
+            tracker.incr_metric(f"api_submit_outcome|{outcome}")
+            if success:
                 tracker.add_feedback(
                     "api_booked",
                     center=center_name,
                     date=str(target),
                     slots=[f"{slot.start}-{slot.end}"],
+                    submit_outcome=outcome,
                 )
                 tracker.set_metric("api_path_success", True)
                 return True
             tracker.incr_metric("api_submit_fail_count")
+            _record_api_failure(
+                outcome,
+                center=center_name,
+                target=target,
+                detail=f"status={submit_res.status_code} final_url={submit_res.final_url}",
+            )
 
     tracker.set_metric("api_path_success", False)
     return False

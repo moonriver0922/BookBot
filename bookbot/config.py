@@ -66,8 +66,9 @@ DEFAULTS = {
     "api": {
         "enabled": False,
         "base_url": "https://www40.polyu.edu.hk",
-        "search_endpoint": "",
-        "submit_endpoint": "",
+        "search_endpoint": "/starspossfbstud/secure/ui_make_book/timetable.json",
+        "prepare_endpoint": "/starspossfbstud/secure/ui_make_book/make_book.do",
+        "submit_endpoint": "/starspossfbstud/secure/ui_make_book/make_book_submit.do",
         "request_timeout_ms": 2500,
         "retry_count": 2,
     },
@@ -158,8 +159,9 @@ class Selectors:
 class ApiSettings:
     enabled: bool = False
     base_url: str = "https://www40.polyu.edu.hk"
-    search_endpoint: str = ""
-    submit_endpoint: str = ""
+    search_endpoint: str = "/starspossfbstud/secure/ui_make_book/timetable.json"
+    prepare_endpoint: str = "/starspossfbstud/secure/ui_make_book/make_book.do"
+    submit_endpoint: str = "/starspossfbstud/secure/ui_make_book/make_book_submit.do"
     request_timeout_ms: int = 2500
     retry_count: int = 2
 
