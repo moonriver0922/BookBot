@@ -2151,6 +2151,13 @@ async def run_booking(
     mode = (config.settings.booking_mode or "ui").strip().lower()
     tracker.set_metric("booking_mode", mode)
 
+    # In rush windows, hybrid mode should prioritize deterministic UI prefill/fire.
+    # Running API-first before rush can consume the critical opening window.
+    if rush and mode == "hybrid":
+        tracker.set_metric("api_skipped_in_rush", True)
+        logger.info("Rush + hybrid detected: skipping API-first and using UI rush flow")
+        return await _run_booking_rush(page, config, dry_run=dry_run, rush_time=rush_time)
+
     if mode in {"api", "hybrid"}:
         logger.info("Booking mode={} (API-first path enabled)", mode)
         with tracker.step("api_first_path"):
