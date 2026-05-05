@@ -1439,14 +1439,24 @@ async def _ensure_booking_form(page: Page, config: AppConfig, *, rush: bool = Fa
         raise FormNotReadyError(f"Booking form controls not actionable: {exc}") from exc
 
 
-async def _build_center_order(page: Page, config: AppConfig) -> list[str]:
+async def _build_center_order(
+    page: Page,
+    config: AppConfig,
+    *,
+    configured_only: bool = False,
+) -> list[str]:
     """Build an ordered list of centers to try.
 
     Priority:
     1. Centers listed in config.preferences.centers (user-defined order)
     2. Any remaining centers from the dropdown that aren't in the list
     """
-    configured = list(config.preferences.centers)
+    configured = [c for c in config.preferences.centers if c.strip()]
+    if not configured and config.preferences.center.strip():
+        configured = [config.preferences.center]
+
+    if configured_only:
+        return configured
 
     dropdown_centers = await get_available_centers(page, config)
     dropdown_names = [c["text"] for c in dropdown_centers]
@@ -2212,7 +2222,7 @@ async def _run_booking_rush(
     with tracker.step("ensure_booking_form"):
         await _ensure_booking_form(page, config, rush=True)
 
-    center_order = await _build_center_order(page, config)
+    center_order = await _build_center_order(page, config, configured_only=True)
     logger.info("Center priority: {}", center_order)
 
     ref_date = target_dates[0]
@@ -2220,6 +2230,7 @@ async def _run_booking_rush(
     # ── Phase 1: Prepare tabs (first tab sync, extras in parallel) ──
     context = page.context
     center_tabs: list[tuple[str, Page]] = []
+    skipped_centers_due_to_deadline = 0
 
     with tracker.step("rush_prepare_tabs"):
         async def _prep_extra_tab(cname: str) -> tuple[str, Page]:
@@ -2240,18 +2251,53 @@ async def _run_booking_rush(
         logger.info("Tab 1 ready: {} (pre-filled for {})", center_order[0], ref_date)
 
         if len(center_order) > 1:
-            extra = await asyncio.gather(
-                *[_prep_extra_tab(cn) for cn in center_order[1:]],
-                return_exceptions=True,
-            )
-            for idx, r in enumerate(extra):
-                if isinstance(r, tuple):
+            extra_centers = center_order[1:]
+            deadline_dt = datetime.now().replace(
+                hour=rush_time[0],
+                minute=rush_time[1],
+                second=rush_time[2],
+                microsecond=0,
+            ) - timedelta(seconds=max(0.0, config.settings.rush_extra_tab_deadline_s))
+            prepare_budget_s = (deadline_dt - datetime.now()).total_seconds()
+
+            if prepare_budget_s <= 0:
+                skipped_centers_due_to_deadline = len(extra_centers)
+                logger.warning(
+                    "Skipping {} extra center tab(s): too close to rush time",
+                    skipped_centers_due_to_deadline,
+                )
+            else:
+                tasks = {
+                    asyncio.create_task(_prep_extra_tab(cn)): cn
+                    for cn in extra_centers
+                }
+                done, pending = await asyncio.wait(
+                    tasks.keys(),
+                    timeout=prepare_budget_s,
+                )
+                skipped_centers_due_to_deadline = len(pending)
+                for task in pending:
+                    task.cancel()
+                    logger.warning(
+                        "Skipping center {}: extra tab missed rush deadline",
+                        tasks[task],
+                    )
+                for task in done:
+                    try:
+                        r = task.result()
+                    except Exception as exc:
+                        logger.warning("Failed to prepare tab for {}: {}", tasks[task], exc)
+                        continue
                     center_tabs.append(r)
-                    logger.info("Tab {} ready: {} (pre-filled for {})",
-                                len(center_tabs), r[0], ref_date)
-                else:
-                    logger.warning("Failed to prepare tab for {}: {}",
-                                   center_order[idx + 1], r)
+                    logger.info(
+                        "Tab {} ready: {} (pre-filled for {})",
+                        len(center_tabs),
+                        r[0],
+                        ref_date,
+                    )
+
+    tracker.set_metric("prepared_center_count", len(center_tabs))
+    tracker.set_metric("skipped_centers_due_to_deadline", skipped_centers_due_to_deadline)
 
     # ── Phase 2: Wait with lightweight warm-up (forms stay filled) ──
     now = datetime.now()
@@ -2284,6 +2330,19 @@ async def _run_booking_rush(
     # Mark the critical phase — all steps from now go into rush_steps
     tracker.mark_rush_start()
     rush_started_at = time.monotonic()
+    adjusted_now = datetime.now() + timedelta(milliseconds=server_delta_ms)
+    rush_target = adjusted_now.replace(
+        hour=rush_time[0],
+        minute=rush_time[1],
+        second=rush_time[2],
+        microsecond=0,
+    )
+    if config.settings.rush_pre_fire_ms > 0:
+        rush_target = rush_target - timedelta(milliseconds=config.settings.rush_pre_fire_ms)
+    tracker.set_metric(
+        "actual_fire_delay_ms",
+        round((adjusted_now - rush_target).total_seconds() * 1000, 1),
+    )
     first_candidate_seen_at: float | None = None
     first_submit_started_at: float | None = None
     slots_seen_total = 0
@@ -2555,11 +2614,22 @@ async def _run_booking_rush(
             ) -> tuple[str, Page, dict[date, List[TimeSlot]]]:
                 search_id = _selector_id(config.selectors.search_button)
                 try:
-                    await _tab.reload(wait_until="domcontentloaded", timeout=8_000)
-                    await _tab.wait_for_selector(
-                        config.selectors.timetable, state="attached", timeout=5_000,
+                    fired = await _tab.evaluate(
+                        """(searchId) => {
+                            const btn = document.getElementById(searchId);
+                            if (!btn || btn.disabled) return false;
+                            btn.click();
+                            return true;
+                        }""",
+                        search_id,
                     )
-                except Exception:
+                    if not fired:
+                        raise RuntimeError("Search button not ready for direct retry")
+                    tracker.incr_metric("retry_direct_search_count")
+                    await asyncio.sleep(0.6)
+                except Exception as exc:
+                    tracker.incr_metric("retry_fallback_reload_count")
+                    logger.debug("Direct retry search failed for {}: {}", _cn, exc)
                     try:
                         await _tab.goto(BOOKING_URL, wait_until="domcontentloaded", timeout=8_000)
                         await _ensure_booking_form(_tab, config, rush=True)

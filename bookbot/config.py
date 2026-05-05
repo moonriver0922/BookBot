@@ -41,7 +41,8 @@ DEFAULTS = {
         "rush_timetable_probe_ms": [1200, 3200, 6800],
         "rush_reclick_guard_ms": 1400,
         "rush_warmup_mode": "mixed",
-        "rush_retry_offsets_s": [3, 8],
+        "rush_retry_offsets_s": [1, 3, 6, 10],
+        "rush_extra_tab_deadline_s": 2.0,
         "same_slot_retry_limit": 3,
         "same_slot_retry_budget_ms": 3000,
         "next_click_backoff_ms": [150, 300, 500],
@@ -118,7 +119,8 @@ class Settings:
     rush_timetable_probe_ms: List[int] = field(default_factory=lambda: [1200, 3200, 6800])
     rush_reclick_guard_ms: int = 1400
     rush_warmup_mode: str = "mixed"
-    rush_retry_offsets_s: List[int] = field(default_factory=lambda: [3, 8])
+    rush_retry_offsets_s: List[int] = field(default_factory=lambda: [1, 3, 6, 10])
+    rush_extra_tab_deadline_s: float = 2.0
     same_slot_retry_limit: int = 3
     same_slot_retry_budget_ms: int = 3000
     next_click_backoff_ms: List[int] = field(default_factory=lambda: [150, 300, 500])
