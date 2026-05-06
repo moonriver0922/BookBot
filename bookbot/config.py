@@ -11,6 +11,10 @@ CONFIG_SEARCH_PATHS = [
     Path("config.yaml"),
     Path(__file__).resolve().parent.parent / "config.yaml",
 ]
+AUTO_TUNING_SEARCH_PATHS = [
+    Path("auto_tuning.yaml"),
+    Path(__file__).resolve().parent.parent / "auto_tuning.yaml",
+]
 
 DEFAULTS = {
     "preferences": {
@@ -34,7 +38,11 @@ DEFAULTS = {
         "rush_pre_fire_ms": 0,
         "rush_timetable_first_wait_ms": 24000,
         "rush_timetable_retry_wait_ms": 16000,
-        "rush_retry_offsets_s": [3, 8],
+        "rush_timetable_probe_ms": [1200, 3200, 6800],
+        "rush_reclick_guard_ms": 1400,
+        "rush_warmup_mode": "mixed",
+        "rush_retry_offsets_s": [1, 3, 6, 10],
+        "rush_extra_tab_deadline_s": 2.0,
         "same_slot_retry_limit": 3,
         "same_slot_retry_budget_ms": 3000,
         "next_click_backoff_ms": [150, 300, 500],
@@ -59,8 +67,9 @@ DEFAULTS = {
     "api": {
         "enabled": False,
         "base_url": "https://www40.polyu.edu.hk",
-        "search_endpoint": "",
-        "submit_endpoint": "",
+        "search_endpoint": "/starspossfbstud/secure/ui_make_book/timetable.json",
+        "prepare_endpoint": "/starspossfbstud/secure/ui_make_book/make_book.do",
+        "submit_endpoint": "/starspossfbstud/secure/ui_make_book/make_book_submit.do",
         "request_timeout_ms": 2500,
         "retry_count": 2,
     },
@@ -107,7 +116,11 @@ class Settings:
     rush_pre_fire_ms: int = 0
     rush_timetable_first_wait_ms: int = 24000
     rush_timetable_retry_wait_ms: int = 16000
-    rush_retry_offsets_s: List[int] = field(default_factory=lambda: [3, 8])
+    rush_timetable_probe_ms: List[int] = field(default_factory=lambda: [1200, 3200, 6800])
+    rush_reclick_guard_ms: int = 1400
+    rush_warmup_mode: str = "mixed"
+    rush_retry_offsets_s: List[int] = field(default_factory=lambda: [1, 3, 6, 10])
+    rush_extra_tab_deadline_s: float = 2.0
     same_slot_retry_limit: int = 3
     same_slot_retry_budget_ms: int = 3000
     next_click_backoff_ms: List[int] = field(default_factory=lambda: [150, 300, 500])
@@ -148,8 +161,9 @@ class Selectors:
 class ApiSettings:
     enabled: bool = False
     base_url: str = "https://www40.polyu.edu.hk"
-    search_endpoint: str = ""
-    submit_endpoint: str = ""
+    search_endpoint: str = "/starspossfbstud/secure/ui_make_book/timetable.json"
+    prepare_endpoint: str = "/starspossfbstud/secure/ui_make_book/make_book.do"
+    submit_endpoint: str = "/starspossfbstud/secure/ui_make_book/make_book_submit.do"
     request_timeout_ms: int = 2500
     retry_count: int = 2
 
@@ -202,6 +216,13 @@ def load_config(path: str | None = None) -> AppConfig:
         raw = yaml.safe_load(f) or {}
 
     merged = _deep_merge(DEFAULTS, raw)
+    for tuning_path in AUTO_TUNING_SEARCH_PATHS:
+        if tuning_path.is_file():
+            with open(tuning_path, "r", encoding="utf-8") as tf:
+                tuning_raw = yaml.safe_load(tf) or {}
+            if isinstance(tuning_raw, dict):
+                merged = _deep_merge(merged, tuning_raw)
+            break
 
     creds = merged.get("credentials", {})
     prefs = merged.get("preferences", {})

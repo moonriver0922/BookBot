@@ -26,7 +26,11 @@ settings:
   rush_pre_fire_ms: 0             # Positive = click Search this many ms before 08:30:00
   rush_timetable_first_wait_ms: 24000   # Rush: wait for timetable after Search (no re-click)
   rush_timetable_retry_wait_ms: 16000  # One re-click only if first wait times out
-  rush_retry_offsets_s: [3, 8]    # Extra retry waves at T+3s and T+8s (same evening strategy)
+  rush_timetable_probe_ms: [1200, 3200, 6800]  # Probe checkpoints (ms) before guarded re-click
+  rush_reclick_guard_ms: 1400    # Min gap between guarded Search re-clicks
+  rush_warmup_mode: "mixed"      # head | mixed (HEAD + lightweight GET + static probes)
+  rush_retry_offsets_s: [1, 3, 6, 10]  # Extra retry waves after initial scan
+  rush_extra_tab_deadline_s: 2.0  # Skip extra center tabs if not ready this many seconds before rush
   same_slot_retry_limit: 3        # Conflict retry attempts for the same slot
   same_slot_retry_budget_ms: 3000 # Total budget for same-slot conflict retries
   next_click_backoff_ms: [150, 300, 500]  # Next button short retries before fallback
@@ -55,7 +59,8 @@ selectors:
 api:
   enabled: false
   base_url: "https://www40.polyu.edu.hk"
-  search_endpoint: ""            # e.g. /starspossfbstud/secure/api/search
-  submit_endpoint: ""            # e.g. /starspossfbstud/secure/api/submit
+  search_endpoint: "/starspossfbstud/secure/ui_make_book/timetable.json"
+  prepare_endpoint: "/starspossfbstud/secure/ui_make_book/make_book.do"
+  submit_endpoint: "/starspossfbstud/secure/ui_make_book/make_book_submit.do"
   request_timeout_ms: 2500
   retry_count: 2

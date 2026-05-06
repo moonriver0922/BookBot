@@ -11,6 +11,20 @@ from loguru import logger
 
 PLIST_LABEL = "com.bookbot.polyu"
 PLIST_DIR = Path.home() / "Library" / "LaunchAgents"
+BOOKING_START_HOUR = 8
+BOOKING_START_MINUTE = 18
+CAFFEINATE_TIMEOUT_SECONDS = 20 * 60
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _booking_python() -> str:
+    venv_python = _project_root() / ".venv" / "bin" / "python"
+    if venv_python.exists():
+        return str(venv_python)
+    return sys.executable
 
 
 def wait_until_target(hour: int = 8, minute: int = 30, second: int = 0) -> None:
@@ -35,24 +49,41 @@ def wait_until_target(hour: int = 8, minute: int = 30, second: int = 0) -> None:
 
 
 def generate_crontab_entry() -> str:
-    python = sys.executable
-    script = str(Path(__file__).resolve().parent.parent / "run.py")
-    entry = f"20 8 * * * cd \"{Path(script).parent}\" && {python} {script} --auto"
+    python = _booking_python()
+    script = str(_project_root() / "run.py")
+    entry = (
+        f"{BOOKING_START_MINUTE} {BOOKING_START_HOUR} * * * "
+        f"cd \"{Path(script).parent}\" && /usr/bin/caffeinate -dimsu "
+        f"-t {CAFFEINATE_TIMEOUT_SECONDS} {python} {script} --auto"
+    )
     return entry
 
 
-def install_crontab() -> None:
-    entry = generate_crontab_entry()
-    logger.info("Installing crontab entry:\n  {}", entry)
+def generate_review_crontab_entry() -> str:
+    python = sys.executable
+    script = str(Path(__file__).resolve().parent.parent / "run.py")
+    entry = f"0 9 * * * cd \"{Path(script).parent}\" && {python} {script} review --days 14 --auto-fix"
+    return entry
+
+
+def _install_crontab_entries(entries: list[str]) -> None:
+    if not entries:
+        return
 
     result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
     existing = result.stdout if result.returncode == 0 else ""
+    to_add: list[str] = []
+    for entry in entries:
+        if entry in existing:
+            logger.info("Crontab entry already exists:\n  {}", entry)
+            continue
+        to_add.append(entry)
 
-    if entry in existing:
-        logger.info("Crontab entry already exists")
+    if not to_add:
+        logger.info("No new crontab entries to install")
         return
 
-    new_crontab = existing.rstrip("\n") + "\n" + entry + "\n"
+    new_crontab = existing.rstrip("\n") + "\n" + "\n".join(to_add) + "\n"
     proc = subprocess.run(
         ["crontab", "-"],
         input=new_crontab,
@@ -60,14 +91,26 @@ def install_crontab() -> None:
         text=True,
     )
     if proc.returncode == 0:
-        logger.success("Crontab installed successfully")
+        logger.success("Crontab entries installed successfully")
     else:
-        logger.error("Failed to install crontab: {}", proc.stderr)
+        logger.error("Failed to install crontab entries: {}", proc.stderr)
+
+
+def install_crontab() -> None:
+    entry = generate_crontab_entry()
+    logger.info("Installing booking crontab entry:\n  {}", entry)
+    _install_crontab_entries([entry])
+
+
+def install_review_crontab() -> None:
+    entry = generate_review_crontab_entry()
+    logger.info("Installing review crontab entry:\n  {}", entry)
+    _install_crontab_entries([entry])
 
 
 def generate_launchd_plist() -> str:
-    python = sys.executable
-    script = str(Path(__file__).resolve().parent.parent / "run.py")
+    python = _booking_python()
+    script = str(_project_root() / "run.py")
     work_dir = str(Path(script).parent)
     log_path = str(Path(work_dir) / "bookbot.log")
 
@@ -80,6 +123,10 @@ def generate_launchd_plist() -> str:
     <string>{PLIST_LABEL}</string>
     <key>ProgramArguments</key>
     <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-dimsu</string>
+        <string>-t</string>
+        <string>{CAFFEINATE_TIMEOUT_SECONDS}</string>
         <string>{python}</string>
         <string>{script}</string>
         <string>--auto</string>
@@ -89,9 +136,9 @@ def generate_launchd_plist() -> str:
     <key>StartCalendarInterval</key>
     <dict>
         <key>Hour</key>
-        <integer>8</integer>
+        <integer>{BOOKING_START_HOUR}</integer>
         <key>Minute</key>
-        <integer>20</integer>
+        <integer>{BOOKING_START_MINUTE}</integer>
     </dict>
     <key>StandardOutPath</key>
     <string>{log_path}</string>
@@ -128,4 +175,15 @@ def install_schedule() -> None:
         install_launchd()
     else:
         install_crontab()
-    logger.info("Scheduled to run daily at 08:20 (bot prepares early, waits until 08:30:00 to search)")
+    logger.info(
+        "Scheduled to run daily at {:02d}:{:02d} "
+        "(caffeinate keeps Mac awake while bot waits until 08:30:00)",
+        BOOKING_START_HOUR,
+        BOOKING_START_MINUTE,
+    )
+
+
+def install_review_schedule() -> None:
+    """Install the daily 09:00 review task (local crontab)."""
+    install_review_crontab()
+    logger.info("Scheduled review to run daily at 09:00")
