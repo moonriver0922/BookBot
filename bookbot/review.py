@@ -12,6 +12,10 @@ from typing import Any
 import yaml
 from loguru import logger
 
+from bookbot.analyze import _window_filter as _analyze_window_filter
+from bookbot.analyze import summarize as summarize_runs
+from bookbot.budgets import format_budget_section
+
 RUNTIME_PATH = Path("logs/runtime.jsonl")
 FEEDBACK_PATH = Path("logs/feedback.jsonl")
 CHANGELOG_PATH = Path("CHANGELOG.md")
@@ -423,6 +427,11 @@ def run_daily_review(
 
     top_reasons = ", ".join(f"{k}:{v}" for k, v in decision.failure_reasons.most_common(8)) or "none"
     lines.append(f"- Historical failure reasons ({days}d): {top_reasons}")
+
+    window_runtime = _analyze_window_filter(runtime_rows, days)
+    window_feedback = _analyze_window_filter(feedback_rows, days)
+    perf_summary = summarize_runs(window_runtime, window_feedback)
+    lines.extend(format_budget_section(perf_summary, days=days))
 
     adaptive_actions, adaptive_report = _compute_adaptive_actions(
         runtime_path,

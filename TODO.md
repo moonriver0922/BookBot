@@ -9,13 +9,13 @@
 ## Medium Priority
 
 - One-variable enable of `api.submit_canary: true` after Search race is healthy
-- Add performance-budget alerts to daily review text
-- Expand daily review to highlight competition_loss_rate and candidate_to_confirm P90
+- Expand agent prompt with budget-alert context (optional)
 
 ## Low Priority
 
 - Extract rush race/telemetry helpers from `bookbot/booker.py`
 - Check in a redacted live timetable JSON fixture once captured
+- Performance budget alerting dashboards beyond review text
 
 ## Research Questions
 
