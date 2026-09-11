@@ -82,7 +82,8 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 
 ### Git
 
-- Branch: `feature/rush-performance-framework`
-- Commit: `da41f83`
-- Push status: pushed via SSH (`origin` now uses `git@github.com:moonriver0922/BookBot.git`)
-- PR status: blocked by GitHub PAT scope (`createPullRequest` 403); branch is on remote and ready for PR
+- Branch: `feature/rush-performance-framework` (also merged to `main`)
+- Commit: `4181b15` (feature) / `f0e9711` (main merge)
+- Push status: pushed via SSH; `origin` uses `git@github.com:moonriver0922/BookBot.git`
+- Main: updated (`f0e9711`)
+- PR status: skipped (PAT lacks `createPullRequest`); changes are already on `main`
