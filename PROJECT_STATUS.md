@@ -73,8 +73,8 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 ### Validation
 
 - Command: `python -m pytest tests/test_rush_framework.py tests/test_budgets.py -q`
-- Result: pending
-- Notes: ...
+- Result: passed
+- Notes: 11 tests
 
 ### Follow-Up Items
 
@@ -82,7 +82,7 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 
 ### Git
 
-- Branch: `feature/fix-failure-evidence-hierarchy`
+- Branch: `feature/fix-failure-evidence-hierarchy` (merged to `main`)
 - Commit: pending
 - Push status: pending
 
