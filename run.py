@@ -90,6 +90,14 @@ def parse_args() -> argparse.Namespace:
         help="Verbose logging",
     )
 
+    adaptive_p = sub.add_parser("adaptive-report", help="Recommend capped adaptive rush parameters")
+    adaptive_p.add_argument("--days", type=int, default=14, help="Window size in days")
+    adaptive_p.add_argument(
+        "--debug",
+        action="store_true",
+        help="Verbose logging",
+    )
+
     plan_p = sub.add_parser("plan", help="Call Cursor Agent for plan-style log analysis")
     plan_p.add_argument("--days", type=int, default=14, help="Window size in days")
     plan_p.add_argument(
@@ -227,6 +235,17 @@ def main() -> None:
         from bookbot.timing import format_timing_report
 
         report = format_timing_report(Path("logs/runtime.jsonl"), days=args.days)
+        logger.info("\n{}", report.rstrip())
+        return
+
+    if args.command == "adaptive-report":
+        from bookbot.adaptive import format_adaptive_report
+
+        report = format_adaptive_report(
+            Path("logs/runtime.jsonl"),
+            Path("logs/feedback.jsonl"),
+            days=args.days,
+        )
         logger.info("\n{}", report.rstrip())
         return
 
