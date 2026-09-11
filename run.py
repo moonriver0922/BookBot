@@ -82,6 +82,14 @@ def parse_args() -> argparse.Namespace:
         help="Verbose logging",
     )
 
+    timing_p = sub.add_parser("timing-report", help="Recommend rush fire offsets from logs")
+    timing_p.add_argument("--days", type=int, default=14, help="Window size in days")
+    timing_p.add_argument(
+        "--debug",
+        action="store_true",
+        help="Verbose logging",
+    )
+
     plan_p = sub.add_parser("plan", help="Call Cursor Agent for plan-style log analysis")
     plan_p.add_argument("--days", type=int, default=14, help="Window size in days")
     plan_p.add_argument(
@@ -212,6 +220,13 @@ def main() -> None:
         from bookbot.rollout import summarize_rollout
 
         report = summarize_rollout(Path("logs/runtime.jsonl"), days=args.days)
+        logger.info("\n{}", report.rstrip())
+        return
+
+    if args.command == "timing-report":
+        from bookbot.timing import format_timing_report
+
+        report = format_timing_report(Path("logs/runtime.jsonl"), days=args.days)
         logger.info("\n{}", report.rstrip())
         return
 

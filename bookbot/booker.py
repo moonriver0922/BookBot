@@ -20,6 +20,7 @@ from bookbot.api_client import (
     extract_form_fields_from_html,
 )
 from bookbot.stealth import human_click, human_delay, save_debug_snapshot
+from bookbot.timing import normalize_boundary_offsets, seconds_until_offset
 from bookbot.tracker import tracker
 
 if TYPE_CHECKING:
@@ -1666,32 +1667,37 @@ async def _async_wait_until_with_offset(
     second: int = 0,
     *,
     pre_fire_ms: int = 0,
+    offset_ms: int | None = None,
     server_delta_ms: float = 0.0,
 ) -> None:
-    """Wait using server-compensated wall clock when server_delta_ms is provided."""
+    """Wait using server-compensated wall clock.
+
+    Prefer signed ``offset_ms`` relative to open (negative = early).
+    Legacy ``pre_fire_ms`` means milliseconds before open when positive.
+    """
     def _server_now() -> datetime:
         return datetime.now() + timedelta(milliseconds=server_delta_ms)
 
     now = _server_now()
-    local_now = datetime.now()
     target = now.replace(hour=hour, minute=minute, second=second, microsecond=0)
-    if pre_fire_ms > 0:
-        target = target - timedelta(milliseconds=pre_fire_ms)
+    if offset_ms is not None:
+        signed_offset = int(offset_ms)
+    else:
+        signed_offset = -int(pre_fire_ms) if int(pre_fire_ms) > 0 else 0
+    target = target + timedelta(milliseconds=signed_offset)
     if now >= target:
-        logger.debug("Target time {:02d}:{:02d}:{:02d} already passed, proceeding immediately", hour, minute, second)
+        logger.debug(
+            "Target time {:02d}:{:02d}:{:02d}{:+d}ms already passed, proceeding immediately",
+            hour, minute, second, signed_offset,
+        )
         return
 
     delta = (target - now).total_seconds()
-    if pre_fire_ms > 0:
-        logger.info(
-            "Preparation complete. Waiting {:.1f}s until {:02d}:{:02d}:{:02d} (pre-fire {}ms, server_delta={:.1f}ms) …",
-            delta, hour, minute, second, pre_fire_ms, server_delta_ms,
-        )
-    else:
-        logger.info(
-            "Preparation complete. Waiting {:.1f}s until {:02d}:{:02d}:{:02d} (server_delta={:.1f}ms) …",
-            delta, hour, minute, second, server_delta_ms,
-        )
+    logger.info(
+        "Preparation complete. Waiting {:.1f}s until {:02d}:{:02d}:{:02d}{:+d}ms "
+        "(server_delta={:.1f}ms) …",
+        delta, hour, minute, second, signed_offset, server_delta_ms,
+    )
 
     if delta > 2:
         await asyncio.sleep(delta - 2)
@@ -1700,9 +1706,10 @@ async def _async_wait_until_with_offset(
         await asyncio.sleep(0.005)
 
     logger.info(
-        "Rush time reached: local={} server_adjusted={}",
-        local_now.strftime("%H:%M:%S.%f"),
+        "Fire offset reached: local={} server_adjusted={} offset_ms={:+d}",
+        datetime.now().strftime("%H:%M:%S.%f"),
         _server_now().strftime("%H:%M:%S.%f"),
+        signed_offset,
     )
 
 
@@ -2487,7 +2494,16 @@ async def _run_booking_rush(
     target_dt = now.replace(hour=rush_time[0], minute=rush_time[1], second=rush_time[2], microsecond=0)
     secs_to_rush = (target_dt - now).total_seconds()
     pre_fire_ms = config.settings.rush_pre_fire_ms
+    boundary_offsets = normalize_boundary_offsets(
+        list(getattr(config.settings, "rush_boundary_offsets_ms", []) or []),
+        fallback_pre_fire_ms=pre_fire_ms,
+        enabled=bool(getattr(config.settings, "rush_boundary_enabled", True)),
+        max_probes=int(getattr(config.settings, "rush_boundary_max_probes", 5) or 5),
+    )
+    first_offset_ms = boundary_offsets[0]
     server_delta_ms = await _compute_server_time_delta_ms(page, config)
+    tracker.set_metric("boundary_offsets_ms", boundary_offsets)
+    tracker.set_metric("rush_boundary_enabled", bool(getattr(config.settings, "rush_boundary_enabled", True)))
 
     if secs_to_rush > 7:
         sleep_before_warm = secs_to_rush - 5
@@ -2500,34 +2516,34 @@ async def _run_booking_rush(
 
         await _async_wait_until_with_offset(
             *rush_time,
-            pre_fire_ms=pre_fire_ms,
+            offset_ms=first_offset_ms,
             server_delta_ms=server_delta_ms,
         )
     else:
         with tracker.step("rush_wait"):
             await _async_wait_until_with_offset(
                 *rush_time,
-                pre_fire_ms=pre_fire_ms,
+                offset_ms=first_offset_ms,
                 server_delta_ms=server_delta_ms,
             )
 
-    # Mark the critical phase — all steps from now go into rush_steps
-    tracker.mark_rush_start()
-    rush_started_at = time.monotonic()
-    adjusted_now = datetime.now() + timedelta(milliseconds=server_delta_ms)
-    rush_target = adjusted_now.replace(
-        hour=rush_time[0],
-        minute=rush_time[1],
-        second=rush_time[2],
-        microsecond=0,
+    # Align T0 to official open even when the first probe fires early/late.
+    open_in_s = seconds_until_offset(
+        rush_time,
+        0,
+        server_delta_ms=server_delta_ms,
     )
-    if config.settings.rush_pre_fire_ms > 0:
-        rush_target = rush_target - timedelta(milliseconds=config.settings.rush_pre_fire_ms)
+    tracker.mark_rush_start_aligned(open_in_seconds=open_in_s)
+    rush_started_at = time.monotonic() + open_in_s
+    adjusted_now = datetime.now() + timedelta(milliseconds=server_delta_ms)
     tracker.set_metric(
         "actual_fire_delay_ms",
-        round((adjusted_now - rush_target).total_seconds() * 1000, 1),
+        round((adjusted_now - (adjusted_now.replace(
+            hour=rush_time[0], minute=rush_time[1], second=rush_time[2], microsecond=0,
+        ) + timedelta(milliseconds=first_offset_ms))).total_seconds() * 1000, 1),
     )
     tracker.set_metric("configured_fire_offset_ms", pre_fire_ms)
+    tracker.set_metric("primary_boundary_offset_ms", first_offset_ms)
     tracker.set_metric("estimated_server_delta_ms", server_delta_ms)
     first_candidate_seen_at: float | None = None
     first_submit_started_at: float | None = None
@@ -2538,11 +2554,15 @@ async def _run_booking_rush(
     tracker.set_metric("reclick_count", 0)
     tracker.set_metric("early_scan_attempt_count", 0)
     tracker.set_metric("early_scan_hit_count", 0)
+    tracker.set_metric("boundary_probe_count", 0)
 
     # Global race lock: first acceptable candidate owns booking.
     booking_lock = asyncio.Lock()
     booking_claimed = False
+    inventory_seen = asyncio.Event()
+    stop_boundary_probes = asyncio.Event()
     network_attempt = {"n": 0}
+    boundary_hit_offset_ms: int | None = None
 
     def _attach_network_listener(tab: Page, center_name: str) -> None:
         """Capture Search/Submit RTT from Playwright response events."""
@@ -2615,6 +2635,68 @@ async def _run_booking_rush(
     # ── Phase 3+4: Fire search with staged probes + guarded re-clicks ──
     global_reclick_count = 0
 
+    async def _click_search(tab: Page) -> bool:
+        search_id = _selector_id(config.selectors.search_button)
+        try:
+            return bool(
+                await tab.evaluate(
+                    """(searchId) => {
+                        const btn = document.getElementById(searchId);
+                        if (!btn || btn.disabled) return false;
+                        btn.click();
+                        return true;
+                    }""",
+                    search_id,
+                )
+            )
+        except Exception:
+            return False
+
+    async def _boundary_probe_scheduler() -> None:
+        """Fire a small set of open-boundary Search probes; stop on inventory."""
+        nonlocal boundary_hit_offset_ms
+        for idx, offset_ms in enumerate(boundary_offsets):
+            if idx == 0:
+                # First offset already waited; fire happens inside _fire_and_scan.
+                tracker.incr_metric("boundary_probe_count")
+                tracker.mark_event("boundary_probe_fired", offset_ms=offset_ms, wave=idx)
+                continue
+            wait_s = seconds_until_offset(
+                rush_time,
+                offset_ms,
+                server_delta_ms=server_delta_ms,
+            )
+            if wait_s > 0:
+                try:
+                    await asyncio.wait_for(
+                        stop_boundary_probes.wait(),
+                        timeout=wait_s,
+                    )
+                    return
+                except asyncio.TimeoutError:
+                    pass
+            if stop_boundary_probes.is_set() or inventory_seen.is_set() or booking_claimed:
+                return
+            fired = 0
+            for _cn, tab in center_tabs:
+                if await _click_search(tab):
+                    fired += 1
+            tracker.incr_metric("boundary_probe_count")
+            tracker.mark_event(
+                "boundary_probe_fired",
+                offset_ms=offset_ms,
+                wave=idx,
+                tabs_fired=fired,
+            )
+            logger.info(
+                "Boundary probe {:+d}ms fired on {}/{} tabs",
+                offset_ms,
+                fired,
+                len(center_tabs),
+            )
+
+    probe_task = asyncio.create_task(_boundary_probe_scheduler())
+
     def _first_acceptable_from_scan(
         all_date_slots: dict[date, List[TimeSlot]],
     ) -> tuple[date, List[TimeSlot]] | None:
@@ -2625,15 +2707,38 @@ async def _run_booking_rush(
                 return target, best
         return None
 
+    def _note_inventory(offset_hint: int | None = None) -> None:
+        nonlocal boundary_hit_offset_ms
+        inventory_seen.set()
+        stop_boundary_probes.set()
+        if boundary_hit_offset_ms is None:
+            # Prefer the latest probe offset that could have produced inventory.
+            if offset_hint is not None:
+                boundary_hit_offset_ms = int(offset_hint)
+            else:
+                t_ms = tracker.ms_since_rush()
+                if isinstance(t_ms, (int, float)):
+                    # Snap to nearest configured boundary offset.
+                    boundary_hit_offset_ms = min(
+                        boundary_offsets,
+                        key=lambda o: abs(float(t_ms) - float(o)),
+                    )
+                else:
+                    boundary_hit_offset_ms = first_offset_ms
+            tracker.set_metric("boundary_hit_offset_ms", boundary_hit_offset_ms)
+
     async def _fire_and_scan(
         center_name: str, tab: Page,
     ) -> tuple[str, Page, dict[date, List[TimeSlot]], float, float]:
         nonlocal global_reclick_count
-        search_id = _selector_id(config.selectors.search_button)
         t_search = time.monotonic()
-        await tab.evaluate(f"document.getElementById('{search_id}')?.click()")
-        tracker.mark_event("search_request_fired", center=center_name)
-        logger.info("Search fired: {}", center_name)
+        await _click_search(tab)
+        tracker.mark_event(
+            "search_request_fired",
+            center=center_name,
+            offset_ms=first_offset_ms,
+        )
+        logger.info("Search fired: {} (boundary {:+d}ms)", center_name, first_offset_ms)
 
         first_budget_ms, first_schedule = _derive_wait_budget_for_center(
             center_name,
@@ -2685,6 +2790,7 @@ async def _run_booking_rush(
                 early_choice = _first_acceptable_from_scan(early_scan)
                 if early_choice is not None:
                     # First acceptable slot found — stop waiting for full timetable.
+                    _note_inventory()
                     t_timetable_loaded = time.monotonic()
                     load_dur = t_timetable_loaded - t_search
                     tracker.record_step(f"timetable_load|{center_name}", load_dur)
@@ -2756,6 +2862,8 @@ async def _run_booking_rush(
         tracker.record_step(f"scan_slots|{center_name}", scan_dur)
         if any(result.values()):
             tracker.mark_event("target_date_seen", center=center_name)
+            if _first_acceptable_from_scan(result) is not None:
+                _note_inventory()
 
         return center_name, tab, result, load_dur, scan_dur
 
@@ -2772,6 +2880,8 @@ async def _run_booking_rush(
             if booking_claimed:
                 return False
             booking_claimed = True
+            stop_boundary_probes.set()
+            inventory_seen.set()
             return True
 
     for completed in asyncio.as_completed(tasks):
@@ -2908,6 +3018,15 @@ async def _run_booking_rush(
             break
 
     # Cancel still-running tasks
+    stop_boundary_probes.set()
+    if not probe_task.done():
+        probe_task.cancel()
+        try:
+            await probe_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
     for t in tasks:
         t.cancel()
 
