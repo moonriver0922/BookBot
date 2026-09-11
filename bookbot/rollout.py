@@ -61,45 +61,62 @@ def summarize_rollout(runtime_path: Path, *, days: int = 14) -> str:
         ]
 
     by_mode: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    by_experiment: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         metrics = row.get("metrics") or {}
         if not isinstance(metrics, dict):
             metrics = {}
         mode = str(metrics.get("booking_mode") or row.get("mode") or "unknown")
+        experiment = str(
+            row.get("experiment_id")
+            or metrics.get("experiment_id")
+            or "baseline"
+        )
         by_mode[mode].append(row)
+        by_experiment[experiment].append(row)
 
     lines = [f"Rollout window: last {days}d", ""]
     if not by_mode:
         lines.append("No runtime rows found for the selected window.")
         return "\n".join(lines) + "\n"
 
-    lines.append("Mode | Runs | SuccessRate | P95 total(s) | P95 first_candidate_to_submit(ms)")
-    lines.append("--- | ---: | ---: | ---: | ---:")
-    for mode in sorted(by_mode.keys()):
-        mode_rows = by_mode[mode]
-        total_vals: list[float] = []
-        submit_vals: list[float] = []
-        success = 0
-        for row in mode_rows:
-            if row.get("success"):
-                success += 1
-            td = row.get("total_duration_s")
-            if isinstance(td, (int, float)):
-                total_vals.append(float(td))
-            metrics = row.get("metrics") or {}
-            if isinstance(metrics, dict):
-                submit_ms = metrics.get("first_candidate_to_submit_ms")
-                if isinstance(submit_ms, (int, float)):
-                    submit_vals.append(float(submit_ms))
-        runs = len(mode_rows)
-        success_rate = (success / runs * 100.0) if runs else 0.0
-        lines.append(
-            f"{mode} | {runs} | {success_rate:.1f}% | {_p(total_vals, 95):.2f} | {_p(submit_vals, 95):.1f}"
-        )
+    def _append_group(title: str, groups: dict[str, list[dict[str, Any]]]) -> None:
+        lines.append(title)
+        lines.append("Key | Runs | SuccessRate | P95 total(s) | P95 candidate_to_confirm(ms) | P95 candidate_to_submit(ms)")
+        lines.append("--- | ---: | ---: | ---: | ---: | ---:")
+        for key in sorted(groups.keys()):
+            mode_rows = groups[key]
+            total_vals: list[float] = []
+            submit_vals: list[float] = []
+            confirm_vals: list[float] = []
+            success = 0
+            for row in mode_rows:
+                if row.get("success"):
+                    success += 1
+                td = row.get("total_duration_s")
+                if isinstance(td, (int, float)):
+                    total_vals.append(float(td))
+                metrics = row.get("metrics") or {}
+                if isinstance(metrics, dict):
+                    submit_ms = metrics.get("first_candidate_to_submit_ms")
+                    if isinstance(submit_ms, (int, float)):
+                        submit_vals.append(float(submit_ms))
+                    confirm_ms = metrics.get("candidate_to_confirm_ms")
+                    if isinstance(confirm_ms, (int, float)):
+                        confirm_vals.append(float(confirm_ms))
+            runs = len(mode_rows)
+            success_rate = (success / runs * 100.0) if runs else 0.0
+            lines.append(
+                f"{key} | {runs} | {success_rate:.1f}% | {_p(total_vals, 95):.2f} | "
+                f"{_p(confirm_vals, 95):.1f} | {_p(submit_vals, 95):.1f}"
+            )
+        lines.append("")
 
-    lines.append("")
+    _append_group("By booking_mode", by_mode)
+    _append_group("By experiment_id", by_experiment)
+
     lines.append("Gray rollout suggestion:")
-    lines.append("- Keep `booking_mode: ui` as baseline.")
-    lines.append("- Enable `booking_mode: hybrid` for canary runs and compare this report daily.")
-    lines.append("- Promote to `booking_mode: api` only when hybrid success rate is stable and fallback frequency is low.")
+    lines.append("- Keep one `experiment_id` as baseline; change only one major variable per canary.")
+    lines.append("- Compare success rate + candidate_to_confirm before promoting strategy_version.")
+    lines.append("- Keep `booking_mode: ui` as baseline until hybrid API path is validated.")
     return "\n".join(lines) + "\n"

@@ -863,11 +863,42 @@ def in_time_range(slot: TimeSlot, config: AppConfig) -> bool:
     return slot.start_hour >= tr.start_hour and slot.end_hour <= tr.end_hour
 
 
+def _parse_hhmm(value: str) -> float:
+    h, m = value.split(":")
+    return int(h) + int(m) / 60
+
+
+def meets_min_slot_start(slot: TimeSlot, config: AppConfig) -> bool:
+    """Return True when slot start is at/after configured rush floor."""
+    floor = getattr(config.preferences, "min_slot_start", "") or ""
+    if not floor:
+        return True
+    try:
+        return slot.start_hour >= _parse_hhmm(floor)
+    except Exception:
+        return True
+
+
+def is_acceptable_rush_slot(slot: TimeSlot, config: AppConfig, *, relaxed: bool = False) -> bool:
+    """Rush acceptance: available + start >= min_slot_start.
+
+    Afternoon ``time_range`` is intentionally ignored in rush mode so any
+    acceptable slot can be claimed immediately. ``relaxed`` currently has the
+    same acceptance rule and exists for API symmetry with normal booking.
+    """
+    if not slot.available:
+        return False
+    if not meets_min_slot_start(slot, config):
+        return False
+    _ = relaxed  # reserved for future fallback windows
+    return True
+
+
 def rank_slot(slot: TimeSlot, config: AppConfig) -> float:
     score: float = 0
     if slot.center.lower() == config.preferences.center.lower():
         score += 100
-    # Prefer mid-afternoon: peak at 15:30
+    # Prefer mid-afternoon: peak at 15:30 (normal mode only)
     score += 50 - abs(slot.start_hour - 15.5) * 20
     return score
 
@@ -900,6 +931,22 @@ def _ordered_slots(slots: List[TimeSlot], config: AppConfig) -> List[TimeSlot]:
     )
 
 
+def _ordered_rush_slots(slots: List[TimeSlot], config: AppConfig) -> List[TimeSlot]:
+    """Rush ordering: explicit priorities first, then earliest start.
+
+    Afternoon quality scoring is intentionally disabled so the first
+    acceptable slot can win without waiting for a "better" one.
+    """
+    return sorted(
+        slots,
+        key=lambda s: (
+            _slot_priority_index(s, config),
+            _slot_minutes(s.start),
+            0 if s.center.lower() == config.preferences.center.lower() else 1,
+        ),
+    )
+
+
 def rank_pair(pair: Tuple[TimeSlot, TimeSlot], config: AppConfig) -> float:
     return rank_slot(pair[0], config) + rank_slot(pair[1], config) + 200
 
@@ -919,7 +966,21 @@ def find_best_booking(
     config: AppConfig,
     *,
     relaxed: bool = False,
+    rush: bool = False,
 ) -> List[TimeSlot]:
+    """Select booking candidate(s).
+
+    In rush mode, defaults to first-acceptable single slot (>= min_slot_start)
+    unless ``rush_prefer_consecutive`` explicitly requests pairs.
+    """
+    if rush:
+        return find_rush_booking(
+            slots,
+            remaining_quota,
+            config,
+            relaxed=relaxed,
+        )
+
     if relaxed:
         ftr = config.preferences.fallback_time_range
         if ftr:
@@ -960,6 +1021,47 @@ def find_best_booking(
     # Fallback: single best slot
     best = candidates[0]
     logger.info("Best single slot: {} – {}", best.start, best.end)
+    return [best]
+
+
+def find_rush_booking(
+    slots: List[TimeSlot],
+    remaining_quota: int,
+    config: AppConfig,
+    *,
+    relaxed: bool = False,
+) -> List[TimeSlot]:
+    """Rush selection: first acceptable slot wins."""
+    candidates = [
+        s for s in slots if is_acceptable_rush_slot(s, config, relaxed=relaxed)
+    ]
+    if not candidates:
+        logger.warning("No acceptable rush slots found (>= {})", config.preferences.min_slot_start)
+        return []
+
+    candidates = _ordered_rush_slots(candidates, config)
+    prefer_n = int(getattr(config.settings, "rush_prefer_consecutive", 1) or 1)
+
+    if remaining_quota >= 2 and prefer_n >= 2:
+        pairs = find_consecutive_pairs(candidates)
+        if pairs:
+            # Still pick the earliest/highest-priority pair, not afternoon-scored.
+            best_pair = min(
+                pairs,
+                key=lambda p: (
+                    min(_slot_priority_index(p[0], config), _slot_priority_index(p[1], config)),
+                    _slot_minutes(p[0].start),
+                ),
+            )
+            logger.info(
+                "Rush consecutive pair: {} – {} & {} – {}",
+                best_pair[0].start, best_pair[0].end,
+                best_pair[1].start, best_pair[1].end,
+            )
+            return list(best_pair)
+
+    best = candidates[0]
+    logger.info("Rush first-acceptable slot: {} – {}", best.start, best.end)
     return [best]
 
 
@@ -1183,7 +1285,7 @@ async def _click_next_fast(page: Page, next_selector: str, backoff_ms: list[int]
 
 
 async def book_slots(page: Page, slots_to_book: List[TimeSlot], target: date, config: AppConfig,
-                     *, rush: bool = False) -> bool:
+                     *, rush: bool = False, candidate: dict | None = None) -> bool:
     """Click on the chosen slot(s) in the timetable grid and confirm the booking.
 
     In rush mode, every millisecond counts:
@@ -1191,25 +1293,40 @@ async def book_slots(page: Page, slots_to_book: List[TimeSlot], target: date, co
       - Skip all screenshots
       - Wait for specific elements instead of generic networkidle
       - Tick checkboxes via JS
+      - Use short deadlines + fast fallback instead of multi-second waits
     """
     if not slots_to_book:
         return False
 
+    select_timeout = int(getattr(config.settings, "rush_slot_select_timeout_ms", 200) or 200)
+    confirm_page_timeout = int(getattr(config.settings, "rush_confirm_page_timeout_ms", 800) or 800)
+    confirm_result_timeout = int(getattr(config.settings, "rush_confirm_result_timeout_ms", 1500) or 1500)
+
     # ── Step 1: Click slot cells ──
     if rush:
+        if candidate is not None:
+            tracker.update_candidate(candidate, "click_started_ms")
+            seen = candidate.get("first_seen_ms")
+            clicked = candidate.get("click_started_ms")
+            if isinstance(seen, (int, float)) and isinstance(clicked, (int, float)):
+                tracker.set_metric("candidate_to_click_ms", round(float(clicked) - float(seen), 1))
+
         booked_count = await _click_slots_js(page, slots_to_book, target, config)
         for s in slots_to_book[:booked_count]:
             logger.info("Clicked slot {} – {} (via JS)", s.start, s.end)
 
-        # Verify selection registered: Next button should become enabled.
-        # If not, JS click didn't work — fall back to Playwright native clicks.
+        # Verify selection registered quickly; fall back to native clicks.
         if booked_count > 0:
             try:
                 await page.wait_for_selector(
-                    '#nextButton:not([disabled])', timeout=3_000,
+                    '#nextButton:not([disabled])', timeout=max(50, select_timeout),
                 )
+                if candidate is not None:
+                    tracker.update_candidate(candidate, "selection_registered_ms")
             except Exception:
-                logger.warning("Next button still disabled after JS click — falling back to native clicks")
+                logger.warning("Next still disabled after JS click — native fallback")
+                tracker.add_feedback("js_click_not_registered",
+                                     slots=[f"{s.start}-{s.end}" for s in slots_to_book])
                 booked_count = 0
                 for slot in slots_to_book:
                     cell_handle = await _find_slot_cell(page, slot, target, config)
@@ -1221,10 +1338,30 @@ async def book_slots(page: Page, slots_to_book: List[TimeSlot], target: date, co
                 if booked_count > 0:
                     try:
                         await page.wait_for_selector(
-                            '#nextButton:not([disabled])', timeout=3_000,
+                            '#nextButton:not([disabled])',
+                            timeout=max(50, select_timeout * 2),
                         )
+                        if candidate is not None:
+                            tracker.update_candidate(candidate, "selection_registered_ms")
                     except Exception:
-                        logger.warning("Next button STILL disabled after native clicks")
+                        logger.warning("Next STILL disabled after native clicks")
+                        tracker.add_feedback("native_click_failed",
+                                             slots=[f"{s.start}-{s.end}" for s in slots_to_book])
+                        if candidate is not None:
+                            tracker.finish_candidate(candidate, "automation_failure")
+                        return False
+                else:
+                    tracker.add_feedback("slot_cell_not_found",
+                                         slots=[f"{s.start}-{s.end}" for s in slots_to_book])
+                    if candidate is not None:
+                        tracker.finish_candidate(candidate, "automation_failure")
+                    return False
+
+        if candidate is not None and candidate.get("selection_registered_ms") is not None:
+            click_ms = candidate.get("click_started_ms")
+            sel_ms = candidate.get("selection_registered_ms")
+            if isinstance(click_ms, (int, float)) and isinstance(sel_ms, (int, float)):
+                tracker.set_metric("click_to_selection_ms", round(float(sel_ms) - float(click_ms), 1))
     else:
         booked_count = 0
         for slot in slots_to_book:
@@ -1255,21 +1392,38 @@ async def book_slots(page: Page, slots_to_book: List[TimeSlot], target: date, co
     if await next_btn.count() > 0:
         logger.info("Clicking Next …")
         if rush:
+            if candidate is not None:
+                tracker.update_candidate(candidate, "next_started_ms")
             clicked = await _click_next_fast(page, next_selector, config.settings.next_click_backoff_ms)
             if not clicked:
                 logger.warning("Fast Next click failed")
+                tracker.add_feedback("next_not_found")
+                if candidate is not None:
+                    tracker.finish_candidate(candidate, "automation_failure")
                 return False
         else:
             await next_btn.first.click()
         if rush:
+            tracker.mark_event("confirmation_page_wait_started")
             try:
                 await page.wait_for_selector(
                     'input[type="checkbox"], button:has-text("Confirm"), '
                     'input[value="Confirm"], button:has-text("Submit")',
-                    timeout=10_000,
+                    timeout=max(100, confirm_page_timeout),
                 )
+                tracker.mark_event("confirmation_page_seen")
             except Exception:
-                await page.wait_for_load_state("domcontentloaded", timeout=5_000)
+                tracker.add_feedback("confirmation_page_too_slow",
+                                     timeout_ms=confirm_page_timeout)
+                try:
+                    await page.wait_for_load_state(
+                        "domcontentloaded",
+                        timeout=max(100, confirm_page_timeout),
+                    )
+                except Exception:
+                    if candidate is not None:
+                        tracker.finish_candidate(candidate, "bot_latency_loss")
+                    return False
         else:
             await page.wait_for_load_state("networkidle")
             await human_delay(2.0, 4.0)
@@ -1309,11 +1463,23 @@ async def book_slots(page: Page, slots_to_book: List[TimeSlot], target: date, co
     if await confirm_btn.count() > 0:
         if not rush:
             await human_delay(0.5, 1.0)
+        if rush and candidate is not None:
+            tracker.update_candidate(candidate, "confirm_started_ms")
+            seen = candidate.get("first_seen_ms")
+            conf = candidate.get("confirm_started_ms")
+            sel = candidate.get("selection_registered_ms")
+            if isinstance(seen, (int, float)) and isinstance(conf, (int, float)):
+                tracker.set_metric("candidate_to_confirm_ms", round(float(conf) - float(seen), 1))
+            if isinstance(sel, (int, float)) and isinstance(conf, (int, float)):
+                tracker.set_metric("selection_to_confirm_ms", round(float(conf) - float(sel), 1))
         await confirm_btn.click()
 
         if rush:
             try:
-                await page.wait_for_load_state("domcontentloaded", timeout=10_000)
+                await page.wait_for_load_state(
+                    "domcontentloaded",
+                    timeout=max(100, confirm_result_timeout),
+                )
             except Exception:
                 pass
         else:
@@ -1325,16 +1491,23 @@ async def book_slots(page: Page, slots_to_book: List[TimeSlot], target: date, co
 
         if await _is_booking_conflict(page):
             logger.warning("Slot was already taken (occupied)! Will try another slot.")
+            if candidate is not None:
+                tracker.finish_candidate(candidate, "conflict")
             back_btn = page.locator('a:has-text("Back"), button:has-text("Back")')
             if await back_btn.count() > 0:
                 await back_btn.first.click()
                 try:
-                    await page.wait_for_load_state("domcontentloaded", timeout=5_000)
+                    await page.wait_for_load_state(
+                        "domcontentloaded",
+                        timeout=max(100, confirm_result_timeout),
+                    )
                 except Exception:
                     pass
             return False
 
         logger.success("Booking confirmed ({} slot(s))", booked_count)
+        if candidate is not None:
+            tracker.finish_candidate(candidate, "booked")
 
         try:
             ok_btn = page.locator(
@@ -1352,8 +1525,12 @@ async def book_slots(page: Page, slots_to_book: List[TimeSlot], target: date, co
             logger.debug("OK/Yes button click skipped or timed out: {}", exc)
     else:
         logger.warning("No confirm button found – booking may require manual confirmation")
-        if not rush:
-            await save_debug_snapshot(page, "11_no_confirm_button")
+        if rush:
+            tracker.add_feedback("confirm_not_found")
+            if candidate is not None:
+                tracker.finish_candidate(candidate, "automation_failure")
+            return False
+        await save_debug_snapshot(page, "11_no_confirm_button")
 
     return True
 
@@ -2194,17 +2371,20 @@ async def _run_booking_rush(
     dry_run: bool,
     rush_time: tuple[int, int, int],
 ) -> bool:
-    """Rush mode: parallel multi-tab search for maximum speed at 08:30.
+    """Rush mode: parallel multi-tab race for first acceptable slot.
 
     Strategy:
       1. Open one browser tab per center, pre-fill each form (before rush_time)
       2. At rush_time, click Search in ALL tabs simultaneously
-      3. Race: whichever tab loads the timetable first gets used for booking
-      4. This turns serial 30s+15s = 45s into parallel max(30s,15s) ≈ 15s
+      3. Race: first tab with an acceptable slot claims the booking lock
+      4. Remaining tabs are cancelled once booking is claimed
     """
 
     remaining = config.preferences.weekly_max_slots
     logger.info("Rush mode: skipping quota check, assuming {} slots available", remaining)
+    tracker.set_metric("rush_prefer_consecutive", config.settings.rush_prefer_consecutive)
+    tracker.set_metric("rush_selection_mode", config.settings.rush_selection_mode)
+    tracker.set_metric("min_slot_start", config.preferences.min_slot_start)
 
     target_dates = compute_target_dates(config)
     if not target_dates:
@@ -2213,14 +2393,16 @@ async def _run_booking_rush(
         return False
 
     logger.info(
-        "Rush mode: {} target date(s): {} | quota: {}",
+        "Rush mode: {} target date(s): {} | quota: {} | first-acceptable >= {}",
         len(target_dates),
         [f"{d} ({d.strftime('%a')})" for d in target_dates],
         remaining,
+        config.preferences.min_slot_start,
     )
 
     with tracker.step("ensure_booking_form"):
         await _ensure_booking_form(page, config, rush=True)
+    tracker.mark_event("booking_form_ready")
 
     center_order = await _build_center_order(page, config, configured_only=True)
     logger.info("Center priority: {}", center_order)
@@ -2298,6 +2480,7 @@ async def _run_booking_rush(
 
     tracker.set_metric("prepared_center_count", len(center_tabs))
     tracker.set_metric("skipped_centers_due_to_deadline", skipped_centers_due_to_deadline)
+    tracker.mark_event("criteria_prefilled", centers=[c for c, _ in center_tabs])
 
     # ── Phase 2: Wait with lightweight warm-up (forms stay filled) ──
     now = datetime.now()
@@ -2313,6 +2496,7 @@ async def _run_booking_rush(
 
         with tracker.step("warm_connections"):
             await _warm_connections(center_tabs, mode=config.settings.rush_warmup_mode)
+        tracker.mark_event("connection_warmup_completed")
 
         await _async_wait_until_with_offset(
             *rush_time,
@@ -2343,6 +2527,8 @@ async def _run_booking_rush(
         "actual_fire_delay_ms",
         round((adjusted_now - rush_target).total_seconds() * 1000, 1),
     )
+    tracker.set_metric("configured_fire_offset_ms", pre_fire_ms)
+    tracker.set_metric("estimated_server_delta_ms", server_delta_ms)
     first_candidate_seen_at: float | None = None
     first_submit_started_at: float | None = None
     slots_seen_total = 0
@@ -2353,8 +2539,91 @@ async def _run_booking_rush(
     tracker.set_metric("early_scan_attempt_count", 0)
     tracker.set_metric("early_scan_hit_count", 0)
 
+    # Global race lock: first acceptable candidate owns booking.
+    booking_lock = asyncio.Lock()
+    booking_claimed = False
+    network_attempt = {"n": 0}
+
+    def _attach_network_listener(tab: Page, center_name: str) -> None:
+        """Capture Search/Submit RTT from Playwright response events."""
+
+        async def _on_response(response) -> None:
+            try:
+                url = response.url or ""
+                lower = url.lower()
+                if "timetable" in lower:
+                    req_type = "search"
+                elif "make_book_submit" in lower:
+                    req_type = "submit"
+                elif "make_book" in lower and "submit" not in lower:
+                    req_type = "prepare"
+                else:
+                    return
+                network_attempt["n"] += 1
+                finished = tracker.ms_since_rush()
+                started = finished
+                headers_ms = None
+                try:
+                    timing = response.request.timing
+                except Exception:
+                    timing = None
+                if isinstance(timing, dict):
+                    # Playwright timing values are ms relative to navigation start.
+                    resp_start = timing.get("responseStart")
+                    resp_end = timing.get("responseEnd")
+                    req_start = timing.get("requestStart")
+                    if (
+                        isinstance(finished, (int, float))
+                        and isinstance(resp_end, (int, float))
+                        and isinstance(req_start, (int, float))
+                        and resp_end >= req_start
+                    ):
+                        rtt = float(resp_end) - float(req_start)
+                        started = round(float(finished) - rtt, 1)
+                        if isinstance(resp_start, (int, float)) and resp_start >= req_start:
+                            headers_ms = round(
+                                float(finished) - (float(resp_end) - float(resp_start)),
+                                1,
+                            )
+                size = None
+                try:
+                    headers = response.headers
+                    cl = headers.get("content-length")
+                    if cl is not None:
+                        size = int(cl)
+                except Exception:
+                    size = None
+                tracker.record_network(
+                    request_type=req_type,
+                    status_code=response.status,
+                    request_started_ms=started,
+                    response_headers_ms=headers_ms,
+                    response_finished_ms=finished,
+                    response_size=size,
+                    center=center_name,
+                    attempt=network_attempt["n"],
+                    url=url,
+                )
+            except Exception:
+                return
+
+        tab.on("response", lambda resp: asyncio.create_task(_on_response(resp)))
+
+    for cn, tab in center_tabs:
+        _attach_network_listener(tab, cn)
+
     # ── Phase 3+4: Fire search with staged probes + guarded re-clicks ──
     global_reclick_count = 0
+
+    def _first_acceptable_from_scan(
+        all_date_slots: dict[date, List[TimeSlot]],
+    ) -> tuple[date, List[TimeSlot]] | None:
+        for target in target_dates:
+            slots = all_date_slots.get(target, [])
+            best = find_best_booking(slots, remaining, config, rush=True)
+            if best:
+                return target, best
+        return None
 
     async def _fire_and_scan(
         center_name: str, tab: Page,
@@ -2363,6 +2632,7 @@ async def _run_booking_rush(
         search_id = _selector_id(config.selectors.search_button)
         t_search = time.monotonic()
         await tab.evaluate(f"document.getElementById('{search_id}')?.click()")
+        tracker.mark_event("search_request_fired", center=center_name)
         logger.info("Search fired: {}", center_name)
 
         first_budget_ms, first_schedule = _derive_wait_budget_for_center(
@@ -2395,9 +2665,15 @@ async def _run_booking_rush(
                 f"search_to_first_table_ms|{center_key}",
                 first_table_ms,
             )
+            tracker.mark_event(
+                "first_timetable_dom_seen",
+                center=center_name,
+                search_to_first_table_ms=first_table_ms,
+            )
 
         early_scan: dict[date, List[TimeSlot]] = {}
         early_hit = False
+        early_choice: tuple[date, List[TimeSlot]] | None = None
         if isinstance(first_table_ms, (int, float)):
             tracker.incr_metric("early_scan_attempt_count")
             early_scan = await scan_available_slots_multi(
@@ -2406,6 +2682,20 @@ async def _run_booking_rush(
             early_hit = any(bool(v) for v in early_scan.values())
             if early_hit:
                 tracker.incr_metric("early_scan_hit_count")
+                early_choice = _first_acceptable_from_scan(early_scan)
+                if early_choice is not None:
+                    # First acceptable slot found — stop waiting for full timetable.
+                    t_timetable_loaded = time.monotonic()
+                    load_dur = t_timetable_loaded - t_search
+                    tracker.record_step(f"timetable_load|{center_name}", load_dur)
+                    tracker.record_step(f"scan_slots|{center_name}", 0.0)
+                    tracker.mark_event(
+                        "target_date_seen",
+                        center=center_name,
+                        date=str(early_choice[0]),
+                        early=True,
+                    )
+                    return center_name, tab, early_scan, load_dur, 0.0
 
         if not found and not early_hit:
             found, retry_probe = await _wait_for_rush_timetable_ready(
@@ -2464,6 +2754,8 @@ async def _run_booking_rush(
 
         tracker.record_step(f"timetable_load|{center_name}", load_dur)
         tracker.record_step(f"scan_slots|{center_name}", scan_dur)
+        if any(result.values()):
+            tracker.mark_event("target_date_seen", center=center_name)
 
         return center_name, tab, result, load_dur, scan_dur
 
@@ -2474,8 +2766,16 @@ async def _run_booking_rush(
 
     any_booked = False
 
+    async def _try_claim_booking() -> bool:
+        nonlocal booking_claimed
+        async with booking_lock:
+            if booking_claimed:
+                return False
+            booking_claimed = True
+            return True
+
     for completed in asyncio.as_completed(tasks):
-        if remaining <= 0:
+        if remaining <= 0 or booking_claimed and any_booked:
             break
 
         try:
@@ -2483,6 +2783,9 @@ async def _run_booking_rush(
         except Exception as exc:
             logger.debug("Tab scan failed: {}", exc)
             tracker.add_feedback("tab_scan_failed", error=str(exc))
+            continue
+
+        if booking_claimed and any_booked:
             continue
 
         logger.info("Results ready for {} ({})",
@@ -2496,10 +2799,15 @@ async def _run_booking_rush(
             slots = all_date_slots.get(target, [])
             slots_seen_total += len(slots)
             tracker.set_metric("slots_seen_total", slots_seen_total)
-            best = find_best_booking(slots, remaining, config)
+            best = find_best_booking(slots, remaining, config, rush=True)
             if not best:
-                tracker.add_feedback("no_slots", center=center_name, date=str(target),
-                                     total_slots=len(slots))
+                tracker.add_feedback(
+                    "no_slots",
+                    center=center_name,
+                    date=str(target),
+                    total_slots=len(slots),
+                    after_min_start=config.preferences.min_slot_start,
+                )
                 continue
 
             if first_candidate_seen_at is None:
@@ -2509,7 +2817,24 @@ async def _run_booking_rush(
                     round((first_candidate_seen_at - rush_started_at) * 1000, 1),
                 )
 
-            logger.info("=== Found slots on {} @ {} ===", target, center_name)
+            if not await _try_claim_booking():
+                logger.info("Booking already claimed by another center — skipping {}", center_name)
+                break
+
+            # Cancel competitor scans as soon as we claim.
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+
+            logger.info("=== Claimed first-acceptable on {} @ {} ===", target, center_name)
+
+            candidate = tracker.start_candidate(
+                center=center_name,
+                date=str(target),
+                start=best[0].start,
+                end=best[-1].end,
+                court=best[0].court,
+            )
 
             if dry_run:
                 logger.info("[DRY RUN] Would book on {} @ {}:", target, center_name)
@@ -2517,6 +2842,7 @@ async def _run_booking_rush(
                     logger.info("  {} – {} (court: {})", s.start, s.end, s.court)
                 remaining -= len(best)
                 any_booked = True
+                tracker.finish_candidate(candidate, "dry_run")
                 continue
 
             if first_submit_started_at is None:
@@ -2529,7 +2855,9 @@ async def _run_booking_rush(
 
             tracker.incr_metric("submit_attempt_count")
             with tracker.step(f"book_slots|{center_name}|{target}"):
-                success = await book_slots(tab, best, target, config, rush=True)
+                success = await book_slots(
+                    tab, best, target, config, rush=True, candidate=candidate,
+                )
             if success:
                 remaining -= len(best)
                 any_booked = True
@@ -2537,24 +2865,6 @@ async def _run_booking_rush(
                                      slots=[f"{s.start}-{s.end}" for s in best])
                 tracker.set_metric("late_success_wave", 0)
                 logger.success("Booked {} slot(s) on {} @ {}", len(best), target, center_name)
-
-                if remaining > 0:
-                    logger.info("Reloading booking form for more bookings …")
-                    try:
-                        await tab.goto(BOOKING_URL, wait_until="domcontentloaded")
-                        await _ensure_booking_form(tab, config, rush=True)
-                        remaining_dates = [d for d in target_dates if d > target]
-                        if remaining_dates:
-                            await select_booking_criteria(
-                                tab, remaining_dates[0], config,
-                                center_override=center_name, rush=True,
-                            )
-                            updated = await scan_available_slots_multi(
-                                tab, config, targets=remaining_dates, center_name=center_name,
-                            )
-                            all_date_slots.update(updated)
-                    except Exception as exc:
-                        logger.debug("Failed to reload for more bookings: {}", exc)
                 break
             else:
                 tracker.add_feedback("booking_conflict", center=center_name, date=str(target),
@@ -2564,6 +2874,10 @@ async def _run_booking_rush(
                     if s in slots:
                         slots.remove(s)
                 all_date_slots[target] = slots
+
+                # Allow another claim attempt after conflict.
+                async with booking_lock:
+                    booking_claimed = False
 
                 with tracker.step(f"conflict_retry|{center_name}|{target}"):
                     retry_booked = await _retry_same_slot_lane(
@@ -2586,7 +2900,12 @@ async def _run_booking_rush(
                         retried=True,
                     )
                     logger.success("Conflict retry succeeded for {} on {}", center_name, target)
+                    async with booking_lock:
+                        booking_claimed = True
                     break
+
+        if any_booked:
+            break
 
     # Cancel still-running tasks
     for t in tasks:
@@ -2681,22 +3000,35 @@ async def _run_booking_rush(
                     if remaining <= 0:
                         break
                     slots = all_date_slots.get(target, [])
-                    best = find_best_booking(slots, remaining, config, relaxed=False)
+                    best = find_best_booking(slots, remaining, config, rush=True)
                     if not best:
                         continue
 
-                    logger.info("Wave {}: found slots on {} @ {}", wave, target, cn)
+                    if not await _try_claim_booking():
+                        break
+
+                    logger.info("Wave {}: found slots on {} @ {}", wave, cn, target)
+                    candidate = tracker.start_candidate(
+                        center=cn,
+                        date=str(target),
+                        start=best[0].start,
+                        end=best[-1].end,
+                        court=best[0].court,
+                    )
 
                     if dry_run:
                         for s in best:
                             logger.info("  [DRY RUN] {} – {}", s.start, s.end)
                         remaining -= len(best)
                         any_booked = True
+                        tracker.finish_candidate(candidate, "dry_run")
                         continue
 
                     with tracker.step(f"wave{wave}_book|{cn}|{target}"):
                         tracker.incr_metric("submit_attempt_count")
-                        success = await book_slots(tab, best, target, config, rush=True)
+                        success = await book_slots(
+                            tab, best, target, config, rush=True, candidate=candidate,
+                        )
                     if success:
                         remaining -= len(best)
                         any_booked = True
@@ -2709,6 +3041,11 @@ async def _run_booking_rush(
                         logger.success("Wave {}: booked {} slot(s) on {} @ {}",
                                        wave, len(best), target, cn)
                         break
+                    async with booking_lock:
+                        booking_claimed = False
+
+                if any_booked:
+                    break
 
     # Cleanup extra tabs
     for _cn, tab in center_tabs:

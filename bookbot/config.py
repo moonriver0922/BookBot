@@ -27,6 +27,7 @@ DEFAULTS = {
         "slot_priority_starts": [],
         "book_days_ahead": 7,
         "prefer_consecutive": 2,
+        "min_slot_start": "09:30",
         "weekly_max_slots": 4,
     },
     "settings": {
@@ -46,6 +47,13 @@ DEFAULTS = {
         "same_slot_retry_limit": 3,
         "same_slot_retry_budget_ms": 3000,
         "next_click_backoff_ms": [150, 300, 500],
+        "rush_prefer_consecutive": 1,
+        "rush_selection_mode": "first_acceptable",
+        "rush_slot_select_timeout_ms": 200,
+        "rush_confirm_page_timeout_ms": 800,
+        "rush_confirm_result_timeout_ms": 1500,
+        "experiment_id": "baseline",
+        "strategy_version": "rush-first-acceptable-v1",
     },
     "stealth": {
         "human_delay_min": 0.3,
@@ -103,6 +111,7 @@ class Preferences:
     slot_priority_starts: List[str] = field(default_factory=list)
     book_days_ahead: int = 7
     prefer_consecutive: int = 2
+    min_slot_start: str = "09:30"
     weekly_max_slots: int = 4
 
 
@@ -128,6 +137,13 @@ class Settings:
     rush_time_sync_enabled: bool = True
     rush_time_sync_samples: int = 5
     rush_time_sync_timeout_ms: int = 1500
+    rush_prefer_consecutive: int = 1
+    rush_selection_mode: str = "first_acceptable"
+    rush_slot_select_timeout_ms: int = 200
+    rush_confirm_page_timeout_ms: int = 800
+    rush_confirm_result_timeout_ms: int = 1500
+    experiment_id: str = "baseline"
+    strategy_version: str = "rush-first-acceptable-v1"
 
 
 @dataclass
