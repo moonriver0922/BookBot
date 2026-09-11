@@ -1,7 +1,13 @@
 """Performance budgets and alert evaluation for rush review.
 
-Budgets are soft SLOs for daily review text. They do not change runtime
-behavior; they surface regressions early.
+These are **soft alert thresholds for initial monitoring**, not the final
+“beat human clickers” targets. After 5–10 live rush samples, tighten toward:
+
+  candidate → click      < 50–100ms
+  candidate → confirm    < 500–800ms
+
+Current DEFAULT_BUDGETS only flag regressions in daily review text; they do
+not change runtime behavior.
 """
 from __future__ import annotations
 
@@ -20,7 +26,7 @@ class BudgetThreshold:
     higher_is_worse: bool = True
 
 
-# Soft SLOs for the rush critical path. Tuned for review alerts, not hard fails.
+# Soft alert thresholds (≠ final rush goals). See module docstring.
 DEFAULT_BUDGETS: tuple[BudgetThreshold, ...] = (
     BudgetThreshold("p90_open_to_candidate_ms", "P90 open→candidate", 1500.0, "ms"),
     BudgetThreshold("p90_candidate_to_confirm_ms", "P90 candidate→confirm", 2000.0, "ms"),
@@ -30,6 +36,12 @@ DEFAULT_BUDGETS: tuple[BudgetThreshold, ...] = (
     BudgetThreshold("timetable_load_p90_s", "timetable_load P90", 8.0, "s"),
     BudgetThreshold("timetable_load_gt_8s_rate", "timetable_load >8s rate", 25.0, "%"),
 )
+
+# Aspirational critical-path targets after the pipeline is stable.
+FINAL_RUSH_TARGETS_MS = {
+    "candidate_to_click_ms": (50.0, 100.0),
+    "candidate_to_confirm_ms": (500.0, 800.0),
+}
 
 
 @dataclass(frozen=True)

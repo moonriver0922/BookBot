@@ -415,6 +415,13 @@ class _Tracker:
                 "Likely bottleneck: UI confirmation path or late submit.\n"
                 "Recommended experiment: shorten slot→Next path / test hybrid API submit."
             )
+        if cls == "POSSIBLE_COMPETITION_LOSS":
+            return (
+                "Candidate was seen and no booking completed, but there is no explicit\n"
+                "server conflict / occupied signal.\n"
+                "Do not treat this as proven human competition; inspect candidate_events\n"
+                "for click/Next/confirm failures before raising competition_loss_rate."
+            )
         if cls == "NO_INVENTORY":
             return (
                 "No acceptable slots were observed in this window.\n"

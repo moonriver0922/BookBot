@@ -20,6 +20,7 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 - Optional API submit canary (`api.submit_canary`)
 - P4 bounded adaptive recommendations + daily-review auto-tune wiring
 - Daily review performance-budget alerts (competition_loss / candidate→confirm P90)
+- Failure evidence hierarchy: explicit conflict vs automation vs `POSSIBLE_COMPETITION_LOSS`
 
 ## Partially Implemented
 
@@ -31,23 +32,59 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 
 - Performance budget alerting dashboards beyond review text
 - Hardened API-only rush path after canary proves stable
+- Tighten soft budgets toward final rush targets after 5–10 live samples
 
 ## Known Issues
 
-- Live `config.yaml` may still carry old preference values; copy new keys from
-  `config.example.yaml` when deploying the new strategy.
+- `config.example.yaml` keeps safe defaults (`booking_mode=ui`, `api.enabled=false`);
+  live gitignored `config.yaml` must carry hybrid + API race for the next experiment.
 - Smoke/report artifacts under `logs/` are local-only and should not be committed.
 - HTTPS `gh` PAT cannot create PRs; use SSH for git push.
 - API JSON field names are inferred; first live runs should inspect `api_search_*` metrics.
 - Adaptive tuning needs >=5 rush runs before it becomes ready.
+- Soft review budgets (e.g. candidate→confirm P90 2000ms) are monitoring thresholds,
+  not the final beat-human targets (aim ~500–800ms once stable).
 
 ## Next Recommended Steps
 
-1. Run next rush under `rush-adaptive-v1` and inspect war reports + `first_candidate_source`.
-2. After >=5 rush samples, run `python run.py adaptive-report` / daily review `--auto-tune`.
-3. Validate live `timetable.json` parsing; then consider `submit_canary`.
+1. Next 08:30 rush: collect one complete war report chain (probes → source → latencies → result).
+2. Inspect `first_candidate_source` (API vs UI) before enabling `submit_canary`.
+3. After >=5 rush samples, run `adaptive-report` / daily review `--auto-tune`.
 
 ## Recent Stage History
+
+## 2026-09-11 — Failure evidence hierarchy
+
+### Completed
+
+- Require explicit conflict for `COMPETITION_LOSS`
+- Prefer automation / bot-latency reasons over inferred competition
+- Add `POSSIBLE_COMPETITION_LOSS` for ambiguous candidate-seen losses
+- Document soft budgets ≠ final rush targets
+
+### Changed Files
+
+- `bookbot/failures.py`
+- `bookbot/tracker.py`
+- `bookbot/budgets.py`
+- `tests/test_rush_framework.py`
+- `docs/decisions/0005-failure-evidence-hierarchy.md`
+
+### Validation
+
+- Command: `python -m pytest tests/test_rush_framework.py tests/test_budgets.py -q`
+- Result: pending
+- Notes: ...
+
+### Follow-Up Items
+
+- Collect one high-quality live war report; pause large refactors
+
+### Git
+
+- Branch: `feature/fix-failure-evidence-hierarchy`
+- Commit: pending
+- Push status: pending
 
 ## 2026-09-11 — Performance budget alerts (review)
 

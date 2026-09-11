@@ -71,6 +71,37 @@ def test_classify_competition_vs_no_inventory():
     assert reason2 == "no_slots"
 
 
+def test_classify_automation_beats_ambiguous_competition():
+    cls, reason = classify_run(
+        success=False,
+        events=[
+            {"reason": "js_click_not_registered"},
+            {"reason": "no_bookings_made"},
+        ],
+        metrics={"refresh_to_first_candidate_ms": 450},
+    )
+    assert cls == "AUTOMATION_FAILURE"
+    assert reason == "js_click_not_registered"
+
+    cls2, reason2 = classify_run(
+        success=False,
+        events=[{"reason": "confirm_not_found"}, {"reason": "no_bookings_made"}],
+        metrics={"refresh_to_first_candidate_ms": 300},
+    )
+    assert cls2 == "AUTOMATION_FAILURE"
+    assert reason2 == "confirm_not_found"
+
+
+def test_classify_ambiguous_candidate_is_possible_competition():
+    cls, reason = classify_run(
+        success=False,
+        events=[{"reason": "no_bookings_made"}],
+        metrics={"refresh_to_first_candidate_ms": 600},
+    )
+    assert cls == "POSSIBLE_COMPETITION_LOSS"
+    assert reason == "candidate_seen_no_booking"
+
+
 def test_tracker_writes_run_id_across_logs(tmp_path: Path, monkeypatch):
     tracker = _Tracker()
     monkeypatch.setattr("bookbot.tracker.LOGS_DIR", tmp_path)

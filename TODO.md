@@ -2,13 +2,15 @@
 
 ## High Priority
 
-- Collect live rush samples under `rush-adaptive-v1`
+- Collect one complete live rush war report under `rush-adaptive-v1`
+  (boundary probes → `first_candidate_source` → click/Next/confirm latencies → result)
 - After >=5 rush runs, use `python run.py adaptive-report` and review auto-tune
 - Validate live `timetable.json` parsing (`first_candidate_source`)
 
 ## Medium Priority
 
 - One-variable enable of `api.submit_canary: true` after Search race is healthy
+- Tighten soft budgets toward final targets (candidate→confirm <500–800ms) after samples
 - Expand agent prompt with budget-alert context (optional)
 
 ## Low Priority
