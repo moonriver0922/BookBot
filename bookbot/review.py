@@ -173,6 +173,26 @@ def _compute_actions(reasons: Counter[str], max_actions: int) -> list[tuple[str,
     return actions[:max_actions]
 
 
+def _compute_adaptive_actions(
+    runtime_path: Path,
+    feedback_path: Path,
+    *,
+    days: int,
+    max_actions: int,
+) -> tuple[list[tuple[str, Any, str]], str]:
+    """Build capped adaptive actions and a short report snippet."""
+    from bookbot.adaptive import (
+        compute_adaptive_recommendations,
+        format_adaptive_report,
+        recommendations_to_tuning_actions,
+    )
+
+    rec = compute_adaptive_recommendations(runtime_path, feedback_path, days=days)
+    report = format_adaptive_report(runtime_path, feedback_path, days=days).rstrip()
+    actions = recommendations_to_tuning_actions(rec, max_actions=max_actions)
+    return actions, report
+
+
 def _apply_actions_to_tuning(actions: list[tuple[str, Any, str]]) -> list[str]:
     if not actions:
         return []
@@ -210,10 +230,17 @@ def _apply_actions_to_tuning(actions: list[tuple[str, Any, str]]) -> list[str]:
                 new_val = min(base + step, cap)
             elif isinstance(op, tuple) and op and op[0] == "append_offset":
                 new_val = _append_offset(old_val, int(op[1]))
+            elif isinstance(op, tuple) and op and op[0] == "set":
+                new_val = op[1]
             else:
                 new_val = op
+            if old_val == new_val:
+                continue
             _set_nested(tuning, key, new_val)
             applied.append(f"{key}: {old_val!r} -> {new_val!r} ({comment})")
+
+        if not applied:
+            return []
 
         rendered = yaml.safe_dump(tuning, sort_keys=True, allow_unicode=False)
         AUTO_TUNING_PATH.write_text(rendered, encoding="utf-8")
@@ -374,7 +401,7 @@ def run_daily_review(
     runtime_path: Path = RUNTIME_PATH,
     feedback_path: Path = FEEDBACK_PATH,
     days: int = 14,
-    auto_fix: bool = False,
+    auto_tune: bool = False,
     max_auto_actions: int = 3,
     with_agent: bool = True,
     agent_model: str | None = "gpt-5.3-codex",
@@ -397,8 +424,29 @@ def run_daily_review(
     top_reasons = ", ".join(f"{k}:{v}" for k, v in decision.failure_reasons.most_common(8)) or "none"
     lines.append(f"- Historical failure reasons ({days}d): {top_reasons}")
 
+    adaptive_actions, adaptive_report = _compute_adaptive_actions(
+        runtime_path,
+        feedback_path,
+        days=days,
+        max_actions=max(1, max_auto_actions),
+    )
+    lines.append("- Adaptive recommendation:")
+    for raw in adaptive_report.splitlines():
+        lines.append(f"  {raw}" if raw else "")
+
     if decision.today_status == "success":
         lines.append("- Action: Keep current strategy")
+        if auto_tune and adaptive_actions:
+            try:
+                applied = _apply_actions_to_tuning(adaptive_actions)
+                if applied:
+                    lines.append("- Adaptive auto-tune applied to `auto_tuning.yaml`:")
+                    for item in applied:
+                        lines.append(f"  - {item}")
+                else:
+                    lines.append("- Adaptive auto-tune: no parameter deltas")
+            except Exception as exc:
+                lines.append(f"- Adaptive auto-tune failed and rolled back: {exc}")
         report = _write_review_report(lines)
         _append_changelog(lines)
         logger.info("Review complete (success). Report: {}", report)
@@ -417,6 +465,7 @@ def run_daily_review(
             "  1) Auth and navigation stability",
             "  2) Form readiness and timetable load budgets",
             "  3) Retry and conflict-recovery settings",
+            "  4) Open-boundary timing / API Search race",
         ]
     )
 
@@ -436,30 +485,43 @@ def run_daily_review(
     else:
         lines.append("- Agent analysis: skipped by CLI option")
 
-    if not auto_fix:
-        lines.append("- Auto-fix disabled; generated diagnosis only")
+    if not auto_tune:
+        lines.append("- Auto-tune disabled; generated diagnosis only")
         report = _write_review_report(lines)
         _append_changelog(lines)
-        logger.warning("Review complete (failed, no auto-fix). Report: {}", report)
+        logger.warning("Review complete (failed, no auto-tune). Report: {}", report)
         return 1
 
     actions = _compute_actions(decision.failure_reasons, max_actions=max(1, max_auto_actions))
-    if not actions:
-        lines.append("- Auto-fix: no matching optimization actions for observed failures")
+    merged: list[tuple[str, Any, str]] = []
+    seen_keys: set[str] = set()
+    for action in adaptive_actions + actions:
+        if action[0] in seen_keys:
+            continue
+        seen_keys.add(action[0])
+        merged.append(action)
+        if len(merged) >= max(1, max_auto_actions):
+            break
+
+    if not merged:
+        lines.append("- Auto-tune: no matching optimization actions for observed failures")
         report = _write_review_report(lines)
         _append_changelog(lines)
         logger.warning("Review complete (failed, no action matched). Report: {}", report)
         return 1
 
     try:
-        applied = _apply_actions_to_tuning(actions)
-        lines.append("- Auto-fix applied to `auto_tuning.yaml`:")
-        for item in applied:
-            lines.append(f"  - {item}")
-        lines.append("- Verification: YAML validated; rollback not needed")
+        applied = _apply_actions_to_tuning(merged)
+        if applied:
+            lines.append("- Auto-tune applied to `auto_tuning.yaml`:")
+            for item in applied:
+                lines.append(f"  - {item}")
+            lines.append("- Verification: YAML validated; rollback not needed")
+        else:
+            lines.append("- Auto-tune: recommendations already match current tuning")
         rc = 1
     except Exception as exc:
-        lines.append(f"- Auto-fix failed and rolled back: {exc}")
+        lines.append(f"- Auto-tune failed and rolled back: {exc}")
         rc = 2
 
     report = _write_review_report(lines)

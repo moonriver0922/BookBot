@@ -56,7 +56,7 @@ DEFAULTS = {
         "rush_confirm_page_timeout_ms": 800,
         "rush_confirm_result_timeout_ms": 1500,
         "experiment_id": "baseline",
-        "strategy_version": "rush-api-search-race-v1",
+        "strategy_version": "rush-adaptive-v1",
     },
     "stealth": {
         "human_delay_min": 0.3,
@@ -151,7 +151,7 @@ class Settings:
     rush_confirm_page_timeout_ms: int = 800
     rush_confirm_result_timeout_ms: int = 1500
     experiment_id: str = "baseline"
-    strategy_version: str = "rush-api-search-race-v1"
+    strategy_version: str = "rush-adaptive-v1"
 
 
 @dataclass
