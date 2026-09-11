@@ -4,6 +4,8 @@ All notable review and optimization changes are recorded here.
 
 ## 2026-09-11
 
+- Add per-weekday time windows (`weekday_time_ranges`); Monday morning-only
+  while keeping all other days and `min_slot_start=09:30`.
 - Fix failure classification evidence hierarchy (`POSSIBLE_COMPETITION_LOSS`;
   automation faults no longer inflate competition loss).
 - Add performance-budget alerts to daily review (competition_loss + latency SLOs).

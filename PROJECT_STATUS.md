@@ -21,6 +21,7 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 - P4 bounded adaptive recommendations + daily-review auto-tune wiring
 - Daily review performance-budget alerts (competition_loss / candidate→confirm P90)
 - Failure evidence hierarchy: explicit conflict vs automation vs `POSSIBLE_COMPETITION_LOSS`
+- Per-weekday rush windows via `preferences.weekday_time_ranges`
 
 ## Partially Implemented
 
@@ -52,6 +53,37 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 3. After >=5 rush samples, run `adaptive-report` / daily review `--auto-tune`.
 
 ## Recent Stage History
+
+## 2026-09-11 — Weekday preference windows
+
+### Completed
+
+- `weekday_time_ranges` for per-day acceptance (Monday morning-only)
+- Local live prefs: all 7 days, `min_slot_start=09:30`, Mon end `12:30`
+- Re-enabled LaunchAgent `com.bookbot.polyu` (08:18 → wait for 08:30)
+
+### Changed Files
+
+- `bookbot/config.py`
+- `bookbot/booker.py`
+- `config.example.yaml`
+- `tests/test_rush_framework.py`
+
+### Validation
+
+- Command: `python -m pytest tests/test_rush_framework.py -q`
+- Result: passed
+- Notes: 7 tests; launchctl lists `com.bookbot.polyu`
+
+### Follow-Up Items
+
+- Tomorrow live war report; confirm Monday afternoon is never claimed
+
+### Git
+
+- Branch: `feature/weekday-time-prefs`
+- Commit: pending
+- Push status: pending
 
 ## 2026-09-11 — Failure evidence hierarchy
 

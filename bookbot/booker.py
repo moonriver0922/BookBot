@@ -861,9 +861,21 @@ async def scan_available_slots_multi(
 # Ranking
 # ---------------------------------------------------------------------------
 
-def in_time_range(slot: TimeSlot, config: AppConfig) -> bool:
-    tr = config.preferences.time_range
+def in_time_range(slot: TimeSlot, config: AppConfig, *, target: date | None = None) -> bool:
+    tr = _effective_time_range(config, target)
     return slot.start_hour >= tr.start_hour and slot.end_hour <= tr.end_hour
+
+
+def _effective_time_range(config: AppConfig, target: date | None) -> "TimeRange":
+    """Return weekday-specific window when configured, else global time_range."""
+    from bookbot.config import TimeRange  # local import for typing clarity
+
+    if target is not None:
+        overrides = getattr(config.preferences, "weekday_time_ranges", None) or {}
+        override = overrides.get(target.weekday())
+        if isinstance(override, TimeRange):
+            return override
+    return config.preferences.time_range
 
 
 def _parse_hhmm(value: str) -> float:
@@ -882,18 +894,29 @@ def meets_min_slot_start(slot: TimeSlot, config: AppConfig) -> bool:
         return True
 
 
-def is_acceptable_rush_slot(slot: TimeSlot, config: AppConfig, *, relaxed: bool = False) -> bool:
-    """Rush acceptance: available + start >= min_slot_start.
+def is_acceptable_rush_slot(
+    slot: TimeSlot,
+    config: AppConfig,
+    *,
+    relaxed: bool = False,
+    target: date | None = None,
+) -> bool:
+    """Rush acceptance: available + >= min_slot_start + weekday window if set.
 
-    Afternoon ``time_range`` is intentionally ignored in rush mode so any
-    acceptable slot can be claimed immediately. ``relaxed`` currently has the
-    same acceptance rule and exists for API symmetry with normal booking.
+    Global afternoon ``time_range`` is ignored in rush unless a
+    ``weekday_time_ranges`` override exists for the target weekday (e.g. Monday
+    morning-only). ``relaxed`` is reserved for future fallback windows.
     """
     if not slot.available:
         return False
     if not meets_min_slot_start(slot, config):
         return False
-    _ = relaxed  # reserved for future fallback windows
+    _ = relaxed
+    overrides = getattr(config.preferences, "weekday_time_ranges", None) or {}
+    if target is not None and target.weekday() in overrides:
+        tr = overrides[target.weekday()]
+        if not (slot.start_hour >= tr.start_hour and slot.end_hour <= tr.end_hour):
+            return False
     return True
 
 
@@ -970,6 +993,7 @@ def find_best_booking(
     *,
     relaxed: bool = False,
     rush: bool = False,
+    target: date | None = None,
 ) -> List[TimeSlot]:
     """Select booking candidate(s).
 
@@ -982,6 +1006,7 @@ def find_best_booking(
             remaining_quota,
             config,
             relaxed=relaxed,
+            target=target,
         )
 
     if relaxed:
@@ -994,7 +1019,9 @@ def find_best_booking(
         else:
             candidates = [s for s in slots if s.available]
     else:
-        candidates = [s for s in slots if s.available and in_time_range(s, config)]
+        candidates = [
+            s for s in slots if s.available and in_time_range(s, config, target=target)
+        ]
 
     if not candidates:
         label = "fallback" if relaxed else "preferred-range"
@@ -1033,10 +1060,13 @@ def find_rush_booking(
     config: AppConfig,
     *,
     relaxed: bool = False,
+    target: date | None = None,
 ) -> List[TimeSlot]:
     """Rush selection: first acceptable slot wins."""
     candidates = [
-        s for s in slots if is_acceptable_rush_slot(s, config, relaxed=relaxed)
+        s
+        for s in slots
+        if is_acceptable_rush_slot(s, config, relaxed=relaxed, target=target)
     ]
     if not candidates:
         logger.warning("No acceptable rush slots found (>= {})", config.preferences.min_slot_start)
@@ -1902,7 +1932,9 @@ async def _retry_same_slot_lane(
             continue
 
         same_slots = [s for s in slots if _slot_signature(s) in preferred_sig]
-        choice = same_slots if same_slots else find_best_booking(slots, remaining, config, relaxed=False)
+        choice = same_slots if same_slots else find_best_booking(
+            slots, remaining, config, relaxed=False, target=target,
+        )
         if not choice:
             continue
 
@@ -2294,6 +2326,7 @@ async def _run_booking_api_first(
                 config.preferences.weekly_max_slots,
                 config,
                 rush=bool(rush_time),
+                target=target,
             )
             if not best:
                 continue
@@ -2766,7 +2799,7 @@ async def _run_booking_rush(
     ) -> tuple[date, List[TimeSlot]] | None:
         for target in target_dates:
             slots = all_date_slots.get(target, [])
-            best = find_best_booking(slots, remaining, config, rush=True)
+            best = find_best_booking(slots, remaining, config, rush=True, target=target)
             if best:
                 return target, best
         return None
@@ -3191,7 +3224,7 @@ async def _run_booking_rush(
             slots = all_date_slots.get(target, [])
             slots_seen_total += len(slots)
             tracker.set_metric("slots_seen_total", slots_seen_total)
-            best = find_best_booking(slots, remaining, config, rush=True)
+            best = find_best_booking(slots, remaining, config, rush=True, target=target)
             if not best:
                 tracker.add_feedback(
                     "no_slots",
@@ -3401,7 +3434,7 @@ async def _run_booking_rush(
                     if remaining <= 0:
                         break
                     slots = all_date_slots.get(target, [])
-                    best = find_best_booking(slots, remaining, config, rush=True)
+                    best = find_best_booking(slots, remaining, config, rush=True, target=target)
                     if not best:
                         continue
 
@@ -3521,7 +3554,7 @@ async def _run_booking_normal(
             with tracker.step(f"scan_slots|{target}|{center_name}"):
                 slots = await scan_available_slots(page, config, target=target, center_name=center_name)
 
-            best = find_best_booking(slots, remaining, config)
+            best = find_best_booking(slots, remaining, config, target=target)
             if not best:
                 logger.info("No afternoon slots at {} on {}. Trying next center …", center_name, target)
                 tracker.add_feedback("no_slots", center=center_name, date=str(target),

@@ -4,6 +4,7 @@
 
 - Collect one complete live rush war report under `rush-adaptive-v1`
   (boundary probes → `first_candidate_source` → click/Next/confirm latencies → result)
+- Confirm LaunchAgent fires tomorrow at 08:18 (Mac awake / not sleeping past wake)
 - After >=5 rush runs, use `python run.py adaptive-report` and review auto-tune
 - Validate live `timetable.json` parsing (`first_candidate_source`)
 

@@ -8,10 +8,14 @@ preferences:
   centers:                                 # Priority order; others from dropdown auto-appended
     - "Shaw Sports Complex"
     - "Kwong On Jubilee Sports Centre"
-  preferred_days: [1, 2, 4]       # 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun
+  preferred_days: [0, 1, 2, 3, 4, 5, 6]  # All week; Monday uses weekday_time_ranges
   time_range:
-    start: "14:00"
-    end: "18:00"
+    start: "09:30"
+    end: "23:59"
+  weekday_time_ranges:               # Optional per-weekday overrides (0=Mon … 6=Sun)
+    0:                               # Monday: morning only (no afternoon/evening)
+      start: "09:30"
+      end: "12:30"
   slot_priority_starts: []           # Optional: fixed start-time priority, e.g. ["19:30", "18:30", "20:30"]
   book_days_ahead: 7              # Book the slot N days from now
   prefer_consecutive: 2           # Normal mode: prefer 2 consecutive slots; rush overrides below
