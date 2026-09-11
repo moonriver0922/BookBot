@@ -53,7 +53,32 @@ def test_rush_consecutive_only_when_configured():
     assert chosen[1].start == "10:30"
 
 
-def test_classify_competition_vs_no_inventory():
+def test_monday_weekday_window_blocks_afternoon_in_rush():
+    from datetime import date
+
+    from bookbot.config import TimeRange
+
+    config = AppConfig()
+    config.preferences.min_slot_start = "09:30"
+    config.preferences.weekday_time_ranges = {
+        0: TimeRange(start="09:30", end="12:30"),
+    }
+    config.settings.rush_prefer_consecutive = 1
+    monday = date(2026, 9, 14)
+    assert monday.weekday() == 0
+
+    slots = [
+        TimeSlot("09:30", "10:30", "Shaw Sports Complex", available=True),
+        TimeSlot("15:30", "16:30", "Shaw Sports Complex", available=True),
+    ]
+    chosen = find_rush_booking(slots, remaining_quota=4, config=config, target=monday)
+    assert len(chosen) == 1
+    assert chosen[0].start == "09:30"
+
+    saturday = date(2026, 9, 19)
+    chosen_sat = find_rush_booking(slots, remaining_quota=4, config=config, target=saturday)
+    assert chosen_sat[0].start == "09:30"  # still first-acceptable, not afternoon preference
+
     cls, reason = classify_run(
         success=False,
         events=[{"reason": "booking_conflict"}, {"reason": "no_bookings_made"}],

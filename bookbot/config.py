@@ -24,6 +24,7 @@ DEFAULTS = {
         "preferred_days": [1, 2, 4],
         "time_range": {"start": "14:00", "end": "18:00"},
         "fallback_time_range": None,
+        "weekday_time_ranges": {},
         "slot_priority_starts": [],
         "book_days_ahead": 7,
         "prefer_consecutive": 2,
@@ -113,6 +114,9 @@ class Preferences:
     preferred_days: List[int] = field(default_factory=lambda: [1, 2, 4])
     time_range: TimeRange = field(default_factory=TimeRange)
     fallback_time_range: TimeRange | None = None
+    # Optional per-weekday windows (0=Mon … 6=Sun). When present for a day,
+    # that window replaces the global time_range for acceptance checks.
+    weekday_time_ranges: dict = field(default_factory=dict)
     slot_priority_starts: List[str] = field(default_factory=list)
     book_days_ahead: int = 7
     prefer_consecutive: int = 2
@@ -263,6 +267,17 @@ def load_config(path: str | None = None) -> AppConfig:
     ftr = prefs.pop("fallback_time_range", None)
     fallback_time_range = TimeRange(**ftr) if ftr else None
 
+    wtr_raw = prefs.pop("weekday_time_ranges", None) or {}
+    weekday_time_ranges: dict[int, TimeRange] = {}
+    if isinstance(wtr_raw, dict):
+        for key, value in wtr_raw.items():
+            if not isinstance(value, dict):
+                continue
+            try:
+                weekday_time_ranges[int(key)] = TimeRange(**value)
+            except (TypeError, ValueError):
+                continue
+
     # If user only set "center" (single) but not "centers" (list),
     # populate centers from center so the fallback logic works.
     if "centers" not in raw.get("preferences", {}) and "center" in prefs:
@@ -273,6 +288,7 @@ def load_config(path: str | None = None) -> AppConfig:
         preferences=Preferences(
             time_range=time_range,
             fallback_time_range=fallback_time_range,
+            weekday_time_ranges=weekday_time_ranges,
             **prefs,
         ),
         settings=Settings(**sett),
