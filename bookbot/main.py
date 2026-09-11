@@ -29,7 +29,35 @@ async def execute(
     Path("screenshots").mkdir(exist_ok=True)
 
     mode = "rush" if rush_time else "normal"
-    tracker.start_run(mode=mode)
+    config_snapshot = {
+        "preferences": {
+            "activity": config.preferences.activity,
+            "centers": list(config.preferences.centers),
+            "time_range": {
+                "start": config.preferences.time_range.start,
+                "end": config.preferences.time_range.end,
+            },
+            "min_slot_start": config.preferences.min_slot_start,
+            "prefer_consecutive": config.preferences.prefer_consecutive,
+        },
+        "settings": {
+            "booking_mode": config.settings.booking_mode,
+            "rush_pre_fire_ms": config.settings.rush_pre_fire_ms,
+            "rush_prefer_consecutive": config.settings.rush_prefer_consecutive,
+            "rush_selection_mode": config.settings.rush_selection_mode,
+            "rush_slot_select_timeout_ms": config.settings.rush_slot_select_timeout_ms,
+            "rush_confirm_page_timeout_ms": config.settings.rush_confirm_page_timeout_ms,
+            "experiment_id": config.settings.experiment_id,
+            "strategy_version": config.settings.strategy_version,
+        },
+    }
+    run_id = tracker.start_run(
+        mode=mode,
+        experiment_id=config.settings.experiment_id,
+        strategy_version=config.settings.strategy_version,
+        config_snapshot=config_snapshot,
+    )
+    logger.info("Starting run_id={}", run_id)
 
     async with async_playwright() as pw:
         with tracker.step("browser_launch"):
@@ -42,7 +70,9 @@ async def execute(
             success = await _run_with_retries(page, config, dry_run=dry_run, rush_time=rush_time)
             return success
         finally:
-            tracker.finish_run(success=success)
+            report = tracker.finish_run(success=success)
+            if report is not None:
+                logger.info("Rush report: {}", report)
             await context.close()
             await browser.close()
 
