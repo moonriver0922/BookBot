@@ -83,9 +83,10 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 
 ### Git
 
-- Branch: `feature/rush-api-hybrid-p3`
-- Commit: pending
-- Push status: pending
+- Branch: `feature/rush-api-hybrid-p3` (merged to `main`)
+- Commit: `75ff76d` / main merge `95e022b`
+- Push status: pushed via SSH
+- Main: updated
 
 ## 2026-09-11 — Rush timing boundary probes (P2)
 
