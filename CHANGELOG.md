@@ -4,6 +4,8 @@ All notable review and optimization changes are recorded here.
 
 ## 2026-09-11
 
+- Fix failure classification evidence hierarchy (`POSSIBLE_COMPETITION_LOSS`;
+  automation faults no longer inflate competition loss).
 - Add performance-budget alerts to daily review (competition_loss + latency SLOs).
 - Add bounded adaptive rush tuning (`adaptive-report` + daily review auto-tune caps).
 - Add rush API Search race (hybrid) with UI submit default and optional submit canary.
