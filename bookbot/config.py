@@ -37,6 +37,9 @@ DEFAULTS = {
         "retry_interval": 5,
         "rush_retry_waves": 3,
         "rush_pre_fire_ms": 0,
+        "rush_boundary_enabled": True,
+        "rush_boundary_offsets_ms": [-200, 0, 200, 500],
+        "rush_boundary_max_probes": 5,
         "rush_timetable_first_wait_ms": 24000,
         "rush_timetable_retry_wait_ms": 16000,
         "rush_timetable_probe_ms": [1200, 3200, 6800],
@@ -53,7 +56,7 @@ DEFAULTS = {
         "rush_confirm_page_timeout_ms": 800,
         "rush_confirm_result_timeout_ms": 1500,
         "experiment_id": "baseline",
-        "strategy_version": "rush-first-acceptable-v1",
+        "strategy_version": "rush-timing-boundary-v1",
     },
     "stealth": {
         "human_delay_min": 0.3,
@@ -123,6 +126,9 @@ class Settings:
     retry_interval: int = 5
     rush_retry_waves: int = 3
     rush_pre_fire_ms: int = 0
+    rush_boundary_enabled: bool = True
+    rush_boundary_offsets_ms: List[int] = field(default_factory=lambda: [-200, 0, 200, 500])
+    rush_boundary_max_probes: int = 5
     rush_timetable_first_wait_ms: int = 24000
     rush_timetable_retry_wait_ms: int = 16000
     rush_timetable_probe_ms: List[int] = field(default_factory=lambda: [1200, 3200, 6800])
@@ -143,7 +149,7 @@ class Settings:
     rush_confirm_page_timeout_ms: int = 800
     rush_confirm_result_timeout_ms: int = 1500
     experiment_id: str = "baseline"
-    strategy_version: str = "rush-first-acceptable-v1"
+    strategy_version: str = "rush-timing-boundary-v1"
 
 
 @dataclass

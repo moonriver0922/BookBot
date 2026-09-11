@@ -43,6 +43,8 @@ async def execute(
         "settings": {
             "booking_mode": config.settings.booking_mode,
             "rush_pre_fire_ms": config.settings.rush_pre_fire_ms,
+            "rush_boundary_enabled": config.settings.rush_boundary_enabled,
+            "rush_boundary_offsets_ms": list(config.settings.rush_boundary_offsets_ms),
             "rush_prefer_consecutive": config.settings.rush_prefer_consecutive,
             "rush_selection_mode": config.settings.rush_selection_mode,
             "rush_slot_select_timeout_ms": config.settings.rush_slot_select_timeout_ms,

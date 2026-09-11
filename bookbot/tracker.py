@@ -15,7 +15,7 @@ import subprocess
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -134,6 +134,18 @@ class _Tracker:
         self._rush_start_wall = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         self._in_rush_phase = True
         self.mark_event("rush_open")
+
+    def mark_rush_start_aligned(self, *, open_in_seconds: float) -> None:
+        """Align T0 to the official open instant, even if first fire is early/late.
+
+        ``open_in_seconds`` is seconds from now until open under the
+        server-adjusted clock (negative if open already passed).
+        """
+        self._rush_start_mono = time.monotonic() + float(open_in_seconds)
+        open_wall = datetime.now() + timedelta(seconds=float(open_in_seconds))
+        self._rush_start_wall = open_wall.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        self._in_rush_phase = True
+        self.mark_event("rush_open", open_in_seconds=round(float(open_in_seconds), 3))
 
     def finish_run(self, *, success: bool) -> Path | None:
         """Persist all logs and optionally write a rush war report."""

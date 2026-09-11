@@ -14,17 +14,19 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 - Short rush timeouts for slot→Next→confirm path
 - Observability: `run_id`, timeline, candidate events, network RTT, failure taxonomy, war reports
 - Analyze/rollout extensions for competition-loss funnel and experiment IDs
+- P2 open-boundary probes (`rush_boundary_offsets_ms`) with cancel-on-inventory
+- `bookbot timing-report` offset recommendation from historical runs
 
 ## Partially Implemented
 
 - Network telemetry (response listener; timing quality depends on Playwright)
-- Pre-fire offset experimentation (knob exists; no auto optimizer yet)
+- Adaptive offset recommendation (report exists; auto_tuning write not yet wired)
 - API hybrid rush path (scaffolded, still skipped in rush)
 
 ## Missing
 
-- Adaptive pre-fire / probe offset optimizer (P4)
-- API Search + Submit rush path (P3)
+- P3: API Search + Submit rush path
+- P4: full adaptive timeout/pre-fire with safety caps in daily review
 - Performance budget alerting in daily review
 
 ## Known Issues
@@ -32,15 +34,53 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 - Live `config.yaml` may still carry old preference values; copy new keys from
   `config.example.yaml` when deploying the new strategy.
 - Smoke/report artifacts under `logs/` are local-only and should not be committed.
+- HTTPS `gh` PAT cannot create PRs; use SSH for git push.
 
 ## Next Recommended Steps
 
-1. Copy new rush knobs into local `config.yaml` and tag `experiment_id`.
-2. Collect 20–30 competitive rush windows and compare baseline vs new strategy.
-3. Start P2 pre-fire offset A/B using `rush_pre_fire_ms`.
-4. Resume API hybrid only after UI candidate→confirm P90 is inside budget.
+1. Collect competitive rush windows under `rush-timing-boundary-v1`.
+2. Use `python run.py timing-report` to pick the next one-variable offset experiment.
+3. Start P3 API hybrid search canary after candidate→confirm is stable.
 
 ## Recent Stage History
+
+## 2026-09-11 — Rush timing boundary probes (P2)
+
+### Completed
+
+- Signed boundary offsets with cancel-on-inventory
+- Aligned rush T0 to official open
+- timing-report recommendation CLI
+- Unit tests and ADR
+
+### Changed Files
+
+- `bookbot/timing.py`
+- `bookbot/booker.py`
+- `bookbot/tracker.py`
+- `bookbot/config.py`
+- `bookbot/main.py`
+- `run.py`
+- `config.example.yaml`
+- `tests/test_timing.py`
+- `docs/decisions/0002-rush-boundary-probes.md`
+
+### Validation
+
+- Command: `python -m pytest tests/test_timing.py tests/test_rush_framework.py -q`
+- Result: passed
+- Notes: 9 tests
+
+### Follow-Up Items
+
+- Wire timing recommendation into daily review auto_tuning (bounded)
+- P3 API hybrid rush
+
+### Git
+
+- Branch: `feature/rush-timing-p2`
+- Commit: pending
+- Push status: pending
 
 ## 2026-09-11 — Rush performance framework (P0+P1)
 
