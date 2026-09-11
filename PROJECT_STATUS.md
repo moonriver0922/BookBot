@@ -19,6 +19,7 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 - P3 API Search race in rush hybrid (`api.rush_search_race`) with UI submit default
 - Optional API submit canary (`api.submit_canary`)
 - P4 bounded adaptive recommendations + daily-review auto-tune wiring
+- Daily review performance-budget alerts (competition_loss / candidate→confirm P90)
 
 ## Partially Implemented
 
@@ -47,6 +48,37 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 3. Validate live `timetable.json` parsing; then consider `submit_canary`.
 
 ## Recent Stage History
+
+## 2026-09-11 — Performance budget alerts (review)
+
+### Completed
+
+- Soft SLO budgets in `bookbot/budgets.py`
+- Daily review highlights competition_loss_rate and candidate→confirm P90
+- Warn/breach alerts when budgets exceeded
+
+### Changed Files
+
+- `bookbot/budgets.py`
+- `bookbot/review.py`
+- `tests/test_budgets.py`
+
+### Validation
+
+- Command: `python -m pytest tests/test_budgets.py tests/test_adaptive.py -q`
+- Result: passed
+- Notes: 6 tests
+
+### Follow-Up Items
+
+- Collect live rush samples under adaptive experiment
+- Optional dashboards beyond review text
+
+### Git
+
+- Branch: `feature/rush-budget-alerts-p4b` (merged to `main`)
+- Commit: pending
+- Push status: pending
 
 ## 2026-09-11 — Bounded adaptive tuning (P4)
 
@@ -80,9 +112,9 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 
 ### Git
 
-- Branch: `feature/rush-adaptive-p4`
-- Commit: pending
-- Push status: pending
+- Branch: `feature/rush-adaptive-p4` (merged to `main`)
+- Commit: `7ebdfc1` / merge `202947e`
+- Push status: pushed
 
 ## 2026-09-11 — API Search race in rush (P3)
 
