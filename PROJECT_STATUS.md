@@ -81,9 +81,9 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 
 ### Git
 
-- Branch: `feature/weekday-time-prefs`
-- Commit: pending
-- Push status: pending
+- Branch: `feature/weekday-time-prefs` (merged to `main`)
+- Commit: `ecbb043` / merge `784264a`
+- Push status: pushed
 
 ## 2026-09-11 — Failure evidence hierarchy
 
