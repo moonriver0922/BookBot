@@ -16,18 +16,21 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 - Analyze/rollout extensions for competition-loss funnel and experiment IDs
 - P2 open-boundary probes (`rush_boundary_offsets_ms`) with cancel-on-inventory
 - `bookbot timing-report` offset recommendation from historical runs
+- P3 API Search race in rush hybrid (`api.rush_search_race`) with UI submit default
+- Optional API submit canary (`api.submit_canary`)
 
 ## Partially Implemented
 
 - Network telemetry (response listener; timing quality depends on Playwright)
 - Adaptive offset recommendation (report exists; auto_tuning write not yet wired)
-- API hybrid rush path (scaffolded, still skipped in rush)
+- API submit canary (implemented behind flag; needs live validation)
+- Timetable JSON parser (best-effort; schema must be confirmed on live responses)
 
 ## Missing
 
-- P3: API Search + Submit rush path
 - P4: full adaptive timeout/pre-fire with safety caps in daily review
 - Performance budget alerting in daily review
+- Hardened API-only rush path after canary proves stable
 
 ## Known Issues
 
@@ -35,14 +38,54 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
   `config.example.yaml` when deploying the new strategy.
 - Smoke/report artifacts under `logs/` are local-only and should not be committed.
 - HTTPS `gh` PAT cannot create PRs; use SSH for git push.
+- API JSON field names are inferred; first live runs should inspect `api_search_*` metrics.
 
 ## Next Recommended Steps
 
-1. Collect competitive rush windows under `rush-timing-boundary-v1`.
-2. Use `python run.py timing-report` to pick the next one-variable offset experiment.
-3. Start P3 API hybrid search canary after candidate→confirm is stable.
+1. Run next rush under `rush-api-search-race-v1` and inspect whether `first_candidate_source=api_search`.
+2. If API Search parses zero slots, capture one live `timetable.json` and tighten the parser.
+3. Only then enable `api.submit_canary: true` as a one-variable experiment.
+4. P4 adaptive tuning after enough offset/API samples exist.
 
 ## Recent Stage History
+
+## 2026-09-11 — API Search race in rush (P3)
+
+### Completed
+
+- Timetable JSON parser
+- Rush hybrid API Search race with booking lock
+- UI submit default + optional submit canary
+- Local config switched to hybrid + api.enabled
+
+### Changed Files
+
+- `bookbot/api_timetable.py`
+- `bookbot/api_client.py`
+- `bookbot/booker.py`
+- `bookbot/config.py`
+- `bookbot/main.py`
+- `config.example.yaml`
+- `tests/test_api_timetable.py`
+- `docs/decisions/0003-api-search-race.md`
+
+### Validation
+
+- Command: `python -m pytest tests/test_api_timetable.py tests/test_timing.py tests/test_rush_framework.py -q`
+- Result: passed
+- Notes: 11 tests
+
+### Follow-Up Items
+
+- Validate live JSON schema
+- Enable submit canary carefully
+- P4 adaptive tuning
+
+### Git
+
+- Branch: `feature/rush-api-hybrid-p3`
+- Commit: pending
+- Push status: pending
 
 ## 2026-09-11 — Rush timing boundary probes (P2)
 

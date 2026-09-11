@@ -44,7 +44,7 @@ settings:
   rush_confirm_page_timeout_ms: 800  # Wait for confirm page after Next
   rush_confirm_result_timeout_ms: 1500  # Wait for confirm/result DOM
   experiment_id: "baseline"       # Tag runs for A/B / gray rollout
-  strategy_version: "rush-timing-boundary-v1"
+  strategy_version: "rush-api-search-race-v1"
   booking_mode: "ui"             # ui | hybrid | api
   rush_time_sync_enabled: true   # Align local trigger with server Date header
   rush_time_sync_samples: 5      # Number of probes for median delta
@@ -75,3 +75,5 @@ api:
   submit_endpoint: "/starspossfbstud/secure/ui_make_book/make_book_submit.do"
   request_timeout_ms: 2500
   retry_count: 2
+  rush_search_race: true          # Race API Search with UI at open
+  submit_canary: false            # true = try API prepare/submit after API Search hit
