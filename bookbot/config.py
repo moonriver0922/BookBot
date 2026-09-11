@@ -56,7 +56,7 @@ DEFAULTS = {
         "rush_confirm_page_timeout_ms": 800,
         "rush_confirm_result_timeout_ms": 1500,
         "experiment_id": "baseline",
-        "strategy_version": "rush-timing-boundary-v1",
+        "strategy_version": "rush-api-search-race-v1",
     },
     "stealth": {
         "human_delay_min": 0.3,
@@ -83,6 +83,8 @@ DEFAULTS = {
         "submit_endpoint": "/starspossfbstud/secure/ui_make_book/make_book_submit.do",
         "request_timeout_ms": 2500,
         "retry_count": 2,
+        "rush_search_race": True,
+        "submit_canary": False,
     },
 }
 
@@ -149,7 +151,7 @@ class Settings:
     rush_confirm_page_timeout_ms: int = 800
     rush_confirm_result_timeout_ms: int = 1500
     experiment_id: str = "baseline"
-    strategy_version: str = "rush-timing-boundary-v1"
+    strategy_version: str = "rush-api-search-race-v1"
 
 
 @dataclass
@@ -188,6 +190,8 @@ class ApiSettings:
     submit_endpoint: str = "/starspossfbstud/secure/ui_make_book/make_book_submit.do"
     request_timeout_ms: int = 2500
     retry_count: int = 2
+    rush_search_race: bool = True
+    submit_canary: bool = False
 
 
 @dataclass

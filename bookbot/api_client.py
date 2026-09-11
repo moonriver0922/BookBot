@@ -16,7 +16,7 @@ from bookbot.config import AppConfig
 class ApiCallResult:
     ok: bool
     status_code: int
-    payload: dict[str, Any] | None = None
+    payload: Any = None
     text: str = ""
     error: str = ""
     final_url: str = ""
@@ -132,12 +132,12 @@ class BookingApiClient:
                         files=files,
                     )
                 body_text = response.text
-                data: dict[str, Any] | None = None
+                data: Any = None
                 ctype = response.headers.get("content-type", "")
                 if "json" in ctype.lower():
                     try:
                         parsed = response.json()
-                        if isinstance(parsed, dict):
+                        if isinstance(parsed, (dict, list)):
                             data = parsed
                     except Exception:
                         data = None

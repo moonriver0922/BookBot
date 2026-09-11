@@ -51,6 +51,9 @@ async def execute(
             "rush_confirm_page_timeout_ms": config.settings.rush_confirm_page_timeout_ms,
             "experiment_id": config.settings.experiment_id,
             "strategy_version": config.settings.strategy_version,
+            "api_enabled": config.api.enabled,
+            "api_rush_search_race": config.api.rush_search_race,
+            "api_submit_canary": config.api.submit_canary,
         },
     }
     run_id = tracker.start_run(

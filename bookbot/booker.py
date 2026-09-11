@@ -19,6 +19,7 @@ from bookbot.api_client import (
     build_api_session_bridge,
     extract_form_fields_from_html,
 )
+from bookbot.api_timetable import parse_timetable_payload
 from bookbot.stealth import human_click, human_delay, save_debug_snapshot
 from bookbot.timing import normalize_boundary_offsets, seconds_until_offset
 from bookbot.tracker import tracker
@@ -55,6 +56,7 @@ class TimeSlot:
     court: str = ""
     available: bool = True
     element_selector: str = ""
+    facility_id: str = ""
 
     @property
     def start_hour(self) -> float:
@@ -2153,14 +2155,25 @@ async def _submit_booking_via_protocol(
     target: date,
     slot: TimeSlot,
     config: AppConfig,
+    slot_meta: dict[str, str] | None = None,
 ) -> ApiCallResult:
-    slot_meta = await _extract_slot_protocol_meta(page, slot, target, config)
-    if not slot_meta.get("facility_id"):
+    meta = slot_meta
+    if meta is None:
+        meta = await _extract_slot_protocol_meta(page, slot, target, config)
+    if not meta.get("facility_id") and slot.facility_id:
+        meta = {
+            **(meta or {}),
+            "facility_id": slot.facility_id,
+            "facility_name": slot.court or (meta or {}).get("facility_name", ""),
+            "center_id": (meta or {}).get("center_id") or state.get("center_id", ""),
+            "center_name": (meta or {}).get("center_name") or slot.center,
+        }
+    if not meta.get("facility_id"):
         return ApiCallResult(ok=False, status_code=0, error="missing_facility_id")
 
     prepare_payload = _build_prepare_payload(
         state=state,
-        slot_meta=slot_meta,
+        slot_meta=meta,
         slot=slot,
         target=target,
     )
@@ -2256,16 +2269,32 @@ async def _run_booking_api_first(
                 )
                 continue
 
-            await _click_search_raw(page, config)
-            await _wait_for_timetable(page, config, timeout_ms=8_000, retries=0)
-            slots = await scan_available_slots(
-                page,
+            slots: List[TimeSlot] = []
+            if search_res.payload is not None:
+                parsed = parse_timetable_payload(
+                    search_res.payload,
+                    center_name=center_name,
+                    target_dates=[target],
+                )
+                slots = parsed.get(target, [])
+                tracker.set_metric("api_search_parsed_slots", len(slots))
+
+            if not slots:
+                await _click_search_raw(page, config)
+                await _wait_for_timetable(page, config, timeout_ms=8_000, retries=0)
+                slots = await scan_available_slots(
+                    page,
+                    config,
+                    target=target,
+                    center_name=center_name,
+                    rush=True,
+                )
+            best = find_best_booking(
+                slots,
+                config.preferences.weekly_max_slots,
                 config,
-                target=target,
-                center_name=center_name,
-                rush=True,
+                rush=bool(rush_time),
             )
-            best = find_best_booking(slots, config.preferences.weekly_max_slots, config)
             if not best:
                 continue
 
@@ -2345,11 +2374,11 @@ async def run_booking(
     mode = (config.settings.booking_mode or "ui").strip().lower()
     tracker.set_metric("booking_mode", mode)
 
-    # In rush windows, hybrid mode should prioritize deterministic UI prefill/fire.
-    # Running API-first before rush can consume the critical opening window.
+    # Rush hybrid: keep the UI race path, but enable in-rush API Search race when configured.
     if rush and mode == "hybrid":
-        tracker.set_metric("api_skipped_in_rush", True)
-        logger.info("Rush + hybrid detected: skipping API-first and using UI rush flow")
+        tracker.set_metric("api_skipped_in_rush", False)
+        tracker.set_metric("api_rush_hybrid_ui_race", True)
+        logger.info("Rush + hybrid: using UI rush race with optional API Search race")
         return await _run_booking_rush(page, config, dry_run=dry_run, rush_time=rush_time)
 
     if mode in {"api", "hybrid"}:
@@ -2488,6 +2517,37 @@ async def _run_booking_rush(
     tracker.set_metric("prepared_center_count", len(center_tabs))
     tracker.set_metric("skipped_centers_due_to_deadline", skipped_centers_due_to_deadline)
     tracker.mark_event("criteria_prefilled", centers=[c for c, _ in center_tabs])
+
+    # Optional API Search race (hybrid/ui with api.enabled + rush_search_race).
+    api_client: BookingApiClient | None = None
+    center_states: dict[str, dict[str, str]] = {}
+    tab_by_center = {name: tab for name, tab in center_tabs}
+    api_race_enabled = bool(
+        config.api.enabled
+        and getattr(config.api, "rush_search_race", True)
+        and config.api.search_endpoint
+    )
+    tracker.set_metric("api_rush_search_race", api_race_enabled)
+    tracker.set_metric("api_submit_canary", bool(getattr(config.api, "submit_canary", False)))
+    if api_race_enabled:
+        try:
+            bridge = await build_api_session_bridge(page, config)
+            api_client = BookingApiClient(config, bridge)
+            if not api_client.enabled:
+                api_client = None
+                api_race_enabled = False
+                tracker.set_metric("api_rush_search_race", False)
+            else:
+                for cname, tab in center_tabs:
+                    state = await _extract_booking_form_state(tab, config)
+                    center_states[cname] = state
+                tracker.mark_event("api_session_bridge_ready", centers=list(center_states.keys()))
+        except Exception as exc:
+            logger.warning("API rush race disabled: {}", exc)
+            api_client = None
+            api_race_enabled = False
+            tracker.set_metric("api_rush_search_race", False)
+            tracker.add_feedback("api_step_failed", reason_detail="bridge_failed", detail=str(exc)[:200])
 
     # ── Phase 2: Wait with lightweight warm-up (forms stay filled) ──
     now = datetime.now()
@@ -2694,8 +2754,12 @@ async def _run_booking_rush(
                 fired,
                 len(center_tabs),
             )
+            hook = api_wave_hook
+            if hook is not None:
+                asyncio.create_task(hook(offset_ms))
 
     probe_task = asyncio.create_task(_boundary_probe_scheduler())
+    api_wave_hook = None  # set after claim helpers are ready
 
     def _first_acceptable_from_scan(
         all_date_slots: dict[date, List[TimeSlot]],
@@ -2883,6 +2947,224 @@ async def _run_booking_rush(
             stop_boundary_probes.set()
             inventory_seen.set()
             return True
+
+    async def _api_search_wave(offset_ms: int) -> None:
+        """Race API Search across centers; book first acceptable candidate."""
+        nonlocal any_booked, remaining, first_candidate_seen_at, first_submit_started_at, slots_seen_total
+        if not api_race_enabled or api_client is None:
+            return
+        if booking_claimed or stop_boundary_probes.is_set():
+            return
+
+        async def _search_one(center_name: str) -> tuple[str, dict[date, List[TimeSlot]], float] | None:
+            state = center_states.get(center_name) or {}
+            csrf = state.get("csrf_token", "")
+            if not csrf:
+                return None
+            # Search the earliest target date first (same as UI prep date).
+            target = target_dates[0]
+            payload = _build_search_payload_from_state(state, target)
+            t0 = time.monotonic()
+            tracker.incr_metric("api_search_attempt_count")
+            result = await api_client.search(csrf_token=csrf, payload=payload)
+            rtt_ms = round((time.monotonic() - t0) * 1000.0, 1)
+            tracker.record_network(
+                request_type="search",
+                status_code=result.status_code,
+                request_started_ms=tracker.ms_since_rush(),
+                response_finished_ms=tracker.ms_since_rush(),
+                center=center_name,
+                attempt=int(tracker._metrics.get("api_search_attempt_count", 0) or 0),
+                url=config.api.search_endpoint,
+            )
+            if not result.ok or result.payload is None:
+                tracker.incr_metric("api_search_fail_count")
+                return None
+            parsed = parse_timetable_payload(
+                result.payload,
+                center_name=center_name,
+                target_dates=target_dates,
+            )
+            # If dates missing in JSON, map under the prepared target.
+            if not parsed and target_dates:
+                parsed = parse_timetable_payload(
+                    result.payload,
+                    center_name=center_name,
+                    target_dates=[target_dates[0]],
+                )
+            return center_name, parsed, rtt_ms
+
+        tracker.mark_event("api_search_wave_started", offset_ms=offset_ms)
+        gathered = await asyncio.gather(
+            *[_search_one(cn) for cn, _ in center_tabs],
+            return_exceptions=True,
+        )
+        for item in gathered:
+            if booking_claimed or any_booked or remaining <= 0:
+                return
+            if item is None or isinstance(item, Exception):
+                continue
+            center_name, by_date, rtt_ms = item
+            tracker.set_metric(f"api_search_rtt_ms|{_metric_center_key(center_name)}", rtt_ms)
+            choice = _first_acceptable_from_scan(by_date)
+            if choice is None:
+                continue
+            target, best = choice
+            slots_seen_total_local = sum(len(v) for v in by_date.values())
+            if slots_seen_total_local:
+                slots_seen_total += slots_seen_total_local
+                tracker.set_metric("slots_seen_total", slots_seen_total)
+
+            _note_inventory(offset_ms)
+            if first_candidate_seen_at is None:
+                first_candidate_seen_at = time.monotonic()
+                tracker.set_metric(
+                    "refresh_to_first_candidate_ms",
+                    round((first_candidate_seen_at - rush_started_at) * 1000, 1),
+                )
+                tracker.set_metric("first_candidate_source", "api_search")
+
+            if not await _try_claim_booking():
+                return
+
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+
+            candidate = tracker.start_candidate(
+                center=center_name,
+                date=str(target),
+                start=best[0].start,
+                end=best[-1].end,
+                court=best[0].court,
+            )
+            logger.info(
+                "API Search race claimed {} @ {} ({}) rtt={}ms",
+                best[0].start,
+                center_name,
+                target,
+                rtt_ms,
+            )
+
+            if dry_run:
+                tracker.finish_candidate(candidate, "dry_run")
+                remaining -= len(best)
+                any_booked = True
+                return
+
+            tab = tab_by_center.get(center_name, page)
+            state = center_states.get(center_name, {})
+            submit_canary = bool(getattr(config.api, "submit_canary", False))
+            booked_ok = False
+
+            if submit_canary and best[0].facility_id:
+                tracker.incr_metric("submit_attempt_count")
+                tracker.set_metric("submit_path", "api_canary")
+                if first_submit_started_at is None:
+                    first_submit_started_at = time.monotonic()
+                    if first_candidate_seen_at is not None:
+                        tracker.set_metric(
+                            "first_candidate_to_submit_ms",
+                            round((first_submit_started_at - first_candidate_seen_at) * 1000, 1),
+                        )
+                with tracker.step(f"api_submit|{center_name}|{target}"):
+                    submit_res = await _submit_booking_via_protocol(
+                        tab,
+                        api_client,
+                        state=state,
+                        target=target,
+                        slot=best[0],
+                        config=config,
+                        slot_meta={
+                            "facility_id": best[0].facility_id,
+                            "facility_name": best[0].court,
+                            "center_id": state.get("center_id", ""),
+                            "center_name": center_name,
+                        },
+                    )
+                ok, reason = _classify_api_submit_outcome(submit_res.text, submit_res.final_url)
+                if submit_res.ok and ok:
+                    booked_ok = True
+                    tracker.set_metric("api_submit_outcome", reason)
+                    tracker.finish_candidate(candidate, "booked")
+                else:
+                    tracker.incr_metric("api_submit_canary_fail_count")
+                    tracker.add_feedback(
+                        "api_step_failed",
+                        reason_detail=_classify_api_error("submit", submit_res) if not submit_res.ok else reason,
+                        center=center_name,
+                        date=str(target),
+                    )
+                    tracker.finish_candidate(candidate, "api_submit_failed")
+                    # Release claim so UI path / retries can continue.
+                    async with booking_lock:
+                        booking_claimed = False
+
+            if not booked_ok:
+                # Safe default: UI confirm path on the winning center tab.
+                tracker.set_metric("submit_path", "ui_after_api_search")
+                await _click_search(tab)
+                try:
+                    await tab.wait_for_selector(
+                        config.selectors.timetable,
+                        state="attached",
+                        timeout=max(200, int(config.settings.rush_confirm_page_timeout_ms)),
+                    )
+                except Exception:
+                    pass
+                if first_submit_started_at is None:
+                    first_submit_started_at = time.monotonic()
+                    if first_candidate_seen_at is not None:
+                        tracker.set_metric(
+                            "first_candidate_to_submit_ms",
+                            round((first_submit_started_at - first_candidate_seen_at) * 1000, 1),
+                        )
+                tracker.incr_metric("submit_attempt_count")
+                # Re-claim if canary released it.
+                if not booking_claimed:
+                    if not await _try_claim_booking():
+                        return
+                with tracker.step(f"book_slots_api_hit|{center_name}|{target}"):
+                    booked_ok = await book_slots(
+                        tab, best, target, config, rush=True, candidate=candidate,
+                    )
+                if not booked_ok:
+                    tracker.add_feedback(
+                        "booking_conflict",
+                        center=center_name,
+                        date=str(target),
+                        slots=[f"{s.start}-{s.end}" for s in best],
+                        source="api_search",
+                    )
+                    async with booking_lock:
+                        booking_claimed = False
+                    return
+
+            remaining -= len(best)
+            any_booked = True
+            tracker.add_feedback(
+                "booked",
+                center=center_name,
+                date=str(target),
+                slots=[f"{s.start}-{s.end}" for s in best],
+                source="api_search",
+                submit_path=tracker._metrics.get("submit_path"),
+            )
+            tracker.set_metric("late_success_wave", 0)
+            logger.success(
+                "Booked via API Search race: {} slot(s) on {} @ {}",
+                len(best),
+                target,
+                center_name,
+            )
+            return
+
+    if api_race_enabled:
+        async def _set_api_wave_hook(offset_ms: int) -> None:
+            await _api_search_wave(offset_ms)
+
+        api_wave_hook = _set_api_wave_hook
+        asyncio.create_task(_api_search_wave(first_offset_ms))
 
     for completed in asyncio.as_completed(tasks):
         if remaining <= 0 or booking_claimed and any_booked:
