@@ -78,9 +78,10 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 
 ### Git
 
-- Branch: `feature/rush-timing-p2`
-- Commit: pending
-- Push status: pending
+- Branch: `feature/rush-timing-p2` (merged to `main`)
+- Commit: `f185ef1` / main merge `f762cad`
+- Push status: pushed via SSH
+- Main: updated
 
 ## 2026-09-11 — Rush performance framework (P0+P1)
 
