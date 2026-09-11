@@ -83,8 +83,8 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 ### Git
 
 - Branch: `feature/fix-failure-evidence-hierarchy` (merged to `main`)
-- Commit: pending
-- Push status: pending
+- Commit: `60344a3` / merge `197a6fa`
+- Push status: pushed
 
 ## 2026-09-11 — Performance budget alerts (review)
 
