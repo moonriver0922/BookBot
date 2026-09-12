@@ -42,6 +42,10 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 - Smoke/report artifacts under `logs/` are local-only and should not be committed.
 - HTTPS `gh` PAT cannot create PRs; use SSH for git push.
 - API JSON field names are inferred; first live runs should inspect `api_search_*` metrics.
+- Open-time timetable responses can take >10s; `api.request_timeout_ms` (2500ms)
+  may cut the API race short — tune once live `api_search_*` metrics exist.
+- POSS disables Search while a request is in flight; UI probes/re-clicks cannot
+  add parallel searches during that window (the API race is the parallel channel).
 - Adaptive tuning needs >=5 rush runs before it becomes ready.
 - Soft review budgets (e.g. candidate→confirm P90 2000ms) are monitoring thresholds,
   not the final beat-human targets (aim ~500–800ms once stable).
@@ -53,6 +57,53 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 3. After >=5 rush samples, run `adaptive-report` / daily review `--auto-tune`.
 
 ## Recent Stage History
+
+## 2026-09-12 — Rush race/retry recovery fixes
+
+### Completed
+
+- Fix API Search race crash: `booking_claimed` missing from `_api_search_wave`'s
+  `nonlocal` declaration (every wave raised `UnboundLocalError` since P3).
+- Cancelled sibling scans no longer abort the rush flow; task cleanup and
+  Phase-5 retry waves now run after a failed claim
+  (`sibling_scan_cancelled_count`).
+- Conflict retry lane rebuilds the booking form on stale post-submit pages
+  (`_refire_search_or_rebuild`); can rebook the next acceptable slot on the
+  same date instead of failing to parse a result page.
+- Probe/re-click honesty: blocked-tab diagnostics, real-dispatch counting,
+  boundary-hit snap tolerance (`BOUNDARY_SNAP_TOLERANCE_MS`).
+- Tests: closure-scoping guard (`tests/test_closure_scoping.py`); stale-page
+  conflict recovery suite (`tests/test_conflict_retry.py`).
+
+### Changed Files
+
+- `bookbot/booker.py`
+- `tests/test_closure_scoping.py`
+- `tests/test_conflict_retry.py`
+- `CHANGELOG.md`
+
+### Validation
+
+- Command: `.venv/bin/python -m pytest tests/ -q`
+- Result: passed
+- Notes: 26 tests. Extracted-function smoke run reproduced the pre-fix
+  `UnboundLocalError` in `_api_search_wave`; post-fix version executes cleanly.
+  Cancelled-sibling loop demo confirms cleanup/retry waves now run.
+
+### Follow-Up Items
+
+- Next live rush: confirm `api_search_wave_started` / `api_search_attempt_count`
+  appear; compare `api_search_rtt_ms` with `api.request_timeout_ms` (2500ms).
+- Consider not cancelling sibling scans at claim time so their data survives a
+  failed booking attempt.
+- Review `boundary_probe_blocked_count` distribution before deciding whether
+  probe offsets stay worth firing.
+
+### Git
+
+- Branch: `feature/fix-rush-race-recovery`
+- Commit: `9169f22`
+- Push status: pushed
 
 ## 2026-09-11 — Weekday preference windows
 
