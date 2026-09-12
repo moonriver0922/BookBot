@@ -35,6 +35,12 @@ BOOKING_URL = (
 )
 RUNTIME_LOG_PATH = Path("logs/runtime.jsonl")
 
+# A first-seen inventory timestamp within this distance of a configured
+# boundary offset is attributed to that offset in timing statistics; anything
+# later is recorded as out-of-window instead of being snapped to the latest
+# probe (which would corrupt `bookbot timing-report` recommendations).
+BOUNDARY_SNAP_TOLERANCE_MS = 750
+
 
 def _selector_id(selector: str) -> str:
     return selector[1:] if selector.startswith("#") else selector
@@ -557,8 +563,21 @@ async def _wait_for_rush_timetable_ready(
             if checkpoint_idx >= 1 and (elapsed_ms - last_reclick_elapsed) >= reclick_guard_ms:
                 try:
                     search_id = _selector_id(config.selectors.search_button)
-                    await tab.evaluate(f"document.getElementById('{search_id}')?.click()")
-                    reclick_count += 1
+                    # A disabled button (search already in flight) silently
+                    # swallows .click(); count only real dispatches.
+                    fired = bool(
+                        await tab.evaluate(
+                            """(searchId) => {
+                                const btn = document.getElementById(searchId);
+                                if (!btn || btn.disabled) return false;
+                                btn.click();
+                                return true;
+                            }""",
+                            search_id,
+                        )
+                    )
+                    if fired:
+                        reclick_count += 1
                     last_reclick_elapsed = elapsed_ms
                 except Exception:
                     pass
@@ -1891,6 +1910,61 @@ def _slot_signature(slot: TimeSlot) -> tuple[str, str]:
     return (slot.start, slot.end)
 
 
+async def _refire_search_or_rebuild(
+    tab: Page,
+    config: AppConfig,
+    *,
+    ref_date: date,
+    center_name: str,
+) -> str:
+    """Fire Search on the current page; rebuild the booking form when stale.
+
+    Returns ``"direct"`` when the existing page dispatched the search,
+    ``"rebuilt"`` after a full form rebuild, or ``"failed"``.
+
+    A failed booking submit leaves POSS on a result/error page where the
+    Search button is gone or disabled; clicking it is a silent no-op and any
+    rescan then fails to parse ("Could not parse timetable structure").
+    Rebuilding the form from scratch is the only reliable way back to a
+    usable timetable.
+    """
+    search_id = _selector_id(config.selectors.search_button)
+    fired = False
+    try:
+        fired = bool(
+            await tab.evaluate(
+                """(searchId) => {
+                    const btn = document.getElementById(searchId);
+                    if (!btn || btn.disabled) return false;
+                    btn.click();
+                    return true;
+                }""",
+                search_id,
+            )
+        )
+    except Exception:
+        fired = False
+    if not fired:
+        try:
+            await tab.goto(BOOKING_URL, wait_until="domcontentloaded", timeout=8_000)
+            await _ensure_booking_form(tab, config, rush=True)
+            await select_booking_criteria(
+                tab, ref_date, config,
+                center_override=center_name, auto_search=False, rush=True,
+            )
+            await tab.evaluate(f"document.getElementById('{search_id}')?.click()")
+        except Exception as exc:
+            logger.debug("Rebuild booking form failed for {}: {}", center_name, exc)
+            return "failed"
+    try:
+        await tab.wait_for_selector(
+            config.selectors.timetable, state="attached", timeout=3_000,
+        )
+    except Exception:
+        pass
+    return "direct" if fired else "rebuilt"
+
+
 async def _retry_same_slot_lane(
     tab: Page,
     config: AppConfig,
@@ -1899,13 +1973,19 @@ async def _retry_same_slot_lane(
     target: date,
     preferred_slots: List[TimeSlot],
     remaining: int,
+    ref_date: date | None = None,
 ) -> List[TimeSlot]:
-    """Fast conflict recovery loop: retry same evening slot(s) before moving on."""
+    """Fast conflict recovery loop: retry same evening slot(s) before moving on.
+
+    When the page is left in a stale post-submit state (no usable timetable),
+    rebuild the booking form once so the rescan reads real inventory instead
+    of failing to parse a result page.
+    """
     deadline = time.monotonic() + (config.settings.same_slot_retry_budget_ms / 1000.0)
     retry_limit = max(1, config.settings.same_slot_retry_limit)
 
     preferred_sig = {_slot_signature(s) for s in preferred_slots}
-    search_id = _selector_id(config.selectors.search_button)
+    rebuilt = False
 
     for _attempt in range(1, retry_limit + 1):
         if time.monotonic() >= deadline:
@@ -1913,21 +1993,24 @@ async def _retry_same_slot_lane(
         tracker.incr_metric("conflict_retries")
 
         try:
-            await tab.evaluate(f"document.getElementById('{search_id}')?.click()")
-            await _wait_for_rush_timetable_ready(
-                tab,
-                config,
-                probe_schedule_ms=[500, 1500],
-                reclick_guard_ms=max(300, config.settings.rush_reclick_guard_ms // 2),
-                phase="conflict_retry",
+            scanned = await scan_available_slots_multi(
+                tab, config, targets=[target], center_name=center_name,
             )
-        except Exception:
-            logger.debug("Conflict retry: search re-fire failed for {}", center_name)
-
-        scanned = await scan_available_slots_multi(
-            tab, config, targets=[target], center_name=center_name,
-        )
-        slots = scanned.get(target, [])
+            slots = scanned.get(target, [])
+            if not slots and ref_date is not None and not rebuilt:
+                rebuilt = True
+                status = await _refire_search_or_rebuild(
+                    tab, config, ref_date=ref_date, center_name=center_name,
+                )
+                tracker.set_metric("conflict_retry_rebuild", status)
+                if status != "failed":
+                    scanned = await scan_available_slots_multi(
+                        tab, config, targets=[target], center_name=center_name,
+                    )
+                    slots = scanned.get(target, [])
+        except Exception as exc:
+            logger.debug("Conflict retry scan failed for {}: {}", center_name, exc)
+            continue
         if not slots:
             continue
 
@@ -2774,18 +2857,23 @@ async def _run_booking_rush(
             for _cn, tab in center_tabs:
                 if await _click_search(tab):
                     fired += 1
+            blocked = len(center_tabs) - fired
             tracker.incr_metric("boundary_probe_count")
+            if blocked:
+                tracker.incr_metric("boundary_probe_blocked_count", blocked)
             tracker.mark_event(
                 "boundary_probe_fired",
                 offset_ms=offset_ms,
                 wave=idx,
                 tabs_fired=fired,
+                tabs_blocked=blocked,
             )
             logger.info(
-                "Boundary probe {:+d}ms fired on {}/{} tabs",
+                "Boundary probe {:+d}ms fired on {}/{} tabs ({} blocked: button missing/disabled)",
                 offset_ms,
                 fired,
                 len(center_tabs),
+                blocked,
             )
             hook = api_wave_hook
             if hook is not None:
@@ -2808,21 +2896,30 @@ async def _run_booking_rush(
         nonlocal boundary_hit_offset_ms
         inventory_seen.set()
         stop_boundary_probes.set()
-        if boundary_hit_offset_ms is None:
-            # Prefer the latest probe offset that could have produced inventory.
-            if offset_hint is not None:
-                boundary_hit_offset_ms = int(offset_hint)
-            else:
-                t_ms = tracker.ms_since_rush()
-                if isinstance(t_ms, (int, float)):
-                    # Snap to nearest configured boundary offset.
-                    boundary_hit_offset_ms = min(
-                        boundary_offsets,
-                        key=lambda o: abs(float(t_ms) - float(o)),
-                    )
+        if boundary_hit_offset_ms is not None:
+            return
+        if offset_hint is not None:
+            # Candidate observed by the API wave that fired at this offset.
+            boundary_hit_offset_ms = int(offset_hint)
+        else:
+            t_ms = tracker.ms_since_rush()
+            if isinstance(t_ms, (int, float)):
+                tracker.set_metric("inventory_first_seen_ms", round(float(t_ms), 1))
+                nearest = min(
+                    boundary_offsets,
+                    key=lambda o: abs(float(t_ms) - float(o)),
+                )
+                if abs(float(t_ms) - float(nearest)) <= BOUNDARY_SNAP_TOLERANCE_MS:
+                    boundary_hit_offset_ms = int(nearest)
                 else:
+                    # Inventory surfaced well outside the probe window;
+                    # attributing it to the latest probe would corrupt
+                    # timing-report statistics, so fall back to the primary.
+                    tracker.set_metric("boundary_hit_out_of_window", True)
                     boundary_hit_offset_ms = first_offset_ms
-            tracker.set_metric("boundary_hit_offset_ms", boundary_hit_offset_ms)
+            else:
+                boundary_hit_offset_ms = first_offset_ms
+        tracker.set_metric("boundary_hit_offset_ms", boundary_hit_offset_ms)
 
     async def _fire_and_scan(
         center_name: str, tab: Page,
@@ -2984,6 +3081,7 @@ async def _run_booking_rush(
     async def _api_search_wave(offset_ms: int) -> None:
         """Race API Search across centers; book first acceptable candidate."""
         nonlocal any_booked, remaining, first_candidate_seen_at, first_submit_started_at, slots_seen_total
+        nonlocal booking_claimed
         if not api_race_enabled or api_client is None:
             return
         if booking_claimed or stop_boundary_probes.is_set():
@@ -3205,6 +3303,17 @@ async def _run_booking_rush(
 
         try:
             center_name, tab, all_date_slots, _ld, _sd = await completed
+        except asyncio.CancelledError:
+            # Expected when a sibling scan was cancelled after another center
+            # claimed the booking. Keep the flow alive so cleanup and the
+            # retry waves still run; only re-raise if this task itself is
+            # being cancelled.
+            current = asyncio.current_task()
+            cancelling = getattr(current, "cancelling", None)
+            if cancelling is not None and cancelling() > 0:
+                raise
+            tracker.incr_metric("sibling_scan_cancelled_count")
+            continue
         except Exception as exc:
             logger.debug("Tab scan failed: {}", exc)
             tracker.add_feedback("tab_scan_failed", error=str(exc))
@@ -3312,6 +3421,7 @@ async def _run_booking_rush(
                         target=target,
                         preferred_slots=best,
                         remaining=remaining,
+                        ref_date=ref_date,
                     )
                 if retry_booked:
                     remaining -= len(retry_booked)
@@ -3365,49 +3475,15 @@ async def _run_booking_rush(
             async def _retry_one(
                 _cn: str, _tab: Page,
             ) -> tuple[str, Page, dict[date, List[TimeSlot]]]:
-                search_id = _selector_id(config.selectors.search_button)
-                try:
-                    fired = await _tab.evaluate(
-                        """(searchId) => {
-                            const btn = document.getElementById(searchId);
-                            if (!btn || btn.disabled) return false;
-                            btn.click();
-                            return true;
-                        }""",
-                        search_id,
-                    )
-                    if not fired:
-                        raise RuntimeError("Search button not ready for direct retry")
+                status = await _refire_search_or_rebuild(
+                    _tab, config, ref_date=ref_date, center_name=_cn,
+                )
+                if status == "direct":
                     tracker.incr_metric("retry_direct_search_count")
-                    await asyncio.sleep(0.6)
-                except Exception as exc:
+                else:
                     tracker.incr_metric("retry_fallback_reload_count")
-                    logger.debug("Direct retry search failed for {}: {}", _cn, exc)
-                    try:
-                        await _tab.goto(BOOKING_URL, wait_until="domcontentloaded", timeout=8_000)
-                        await _ensure_booking_form(_tab, config, rush=True)
-                        await select_booking_criteria(
-                            _tab, ref_date, config,
-                            center_override=_cn, auto_search=False, rush=True,
-                        )
-                        await _tab.evaluate(f"document.getElementById('{search_id}')?.click()")
-                        for _ in range(5):
-                            try:
-                                await _tab.wait_for_selector(
-                                    config.selectors.timetable, state="attached", timeout=3_000,
-                                )
-                                break
-                            except Exception:
-                                try:
-                                    await _tab.evaluate(
-                                        f"document.getElementById('{search_id}')?.click()"
-                                    )
-                                except Exception:
-                                    pass
-                    except Exception as exc:
-                        logger.debug("Retry re-navigate failed for {}: {}", _cn, exc)
-                        return _cn, _tab, {}
-
+                if status == "failed":
+                    return _cn, _tab, {}
                 res = await scan_available_slots_multi(
                     _tab, config, targets=target_dates, center_name=_cn,
                 )
