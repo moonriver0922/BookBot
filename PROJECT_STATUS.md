@@ -84,6 +84,15 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 - Config: `api.request_timeout_ms` 2500 -> 15000 (example + live) — all four
   API waves timed out on 2026-09-13 vs ~10s+ server latency.
 
+- Local ops: LaunchAgent start moved 08:18 -> 08:00 (more prep margin); the
+  `caffeinate` window widened 1200 -> 2700s so the earlier start cannot leave
+  the rush uncovered; machine runs `sleep 0` (no idle sleep); job reloaded and
+  verified (`Minute=0`, `Hour=8`).
+- Keepalive for the longer pre-open wait: the pre-fire wait is chunked with a
+  lightweight HEAD ping per tab every ~4 min (`keepalive_ping_count`; login
+  redirect -> `keepalive_session_suspect_count`) so the ~28-min idle window
+  cannot expire the POSS session before the rush.
+
 ### Changed Files
 
 - `bookbot/booker.py`
@@ -110,7 +119,7 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 ### Git
 
 - Branch: `feature/rush-fire-timing-hardening`
-- Commit: `4608153`
+- Commits: `4608153` (fire timing), `7b41b83` (keepalive); docs `b4246b5`
 - Push status: pushed
 
 ## 2026-09-12 — Rush race/retry recovery fixes
