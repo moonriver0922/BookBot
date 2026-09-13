@@ -42,8 +42,13 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 - Smoke/report artifacts under `logs/` are local-only and should not be committed.
 - HTTPS `gh` PAT cannot create PRs; use SSH for git push.
 - API JSON field names are inferred; first live runs should inspect `api_search_*` metrics.
-- Open-time timetable responses can take >10s; `api.request_timeout_ms` (2500ms)
-  may cut the API race short — tune once live `api_search_*` metrics exist.
+- Open-time timetable responses can take >10s. `api.request_timeout_ms` was
+  raised 2500→15000 (2026-09-13) so the API race survives the open burst;
+  watch `api_search_ok_count` / `api_search_fail_count` on the next runs.
+- The pre-open warm-up used to be able to delay the fire (the sync ate its
+  budget, then a slow warm-up stretched it — 2026-09-13 fired ~4.2s late). It
+  is now scheduled after the sync and hard-capped (`warmup_timeout_count`);
+  `actual_fire_delay_ms` should stay near 0 on the next runs.
 - POSS disables Search while a request is in flight; UI probes/re-clicks cannot
   add parallel searches during that window (the API race is the parallel channel).
 - Adaptive tuning needs >=5 rush runs before it becomes ready.
@@ -57,6 +62,56 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 3. After >=5 rush samples, run `adaptive-report` / daily review `--auto-tune`.
 
 ## Recent Stage History
+
+## 2026-09-13 — Fire-timing hardening (never fire late)
+
+### Completed
+
+- 2026-09-13 rush fired ~4.2s late (`actual_fire_delay_ms` 4197.7): the warm-up
+  budget was measured before the 3.4s server-time sync and the slow pre-open
+  server stretched the warm-up to 5.6s; all probes/searches fired at T+4s and
+  no timetable data ever arrived (classified `NO_INVENTORY`, 0 slots seen).
+- Warm-up schedule is recomputed after the sync and anchored to the first
+  fire offset; the warm-up runs under `asyncio.wait_for` with a >=1s fire
+  margin and is abandoned on overrun (`warmup_timeout_count`,
+  `warmup_completed_offset_ms`).
+- Extra-center tab prep retries up to 3 times with a fresh tab
+  (`prep_tab_retry_count`): 2026-09-13 lost the Sports Practice Hall tab to a
+  transient prep timeout.
+- API Search failures are logged with status/error (were silent counters);
+  `record_network` gets real start/finish timestamps (rtt was 0.0);
+  `api_search_ok_count` added.
+- Config: `api.request_timeout_ms` 2500 -> 15000 (example + live) — all four
+  API waves timed out on 2026-09-13 vs ~10s+ server latency.
+
+### Changed Files
+
+- `bookbot/booker.py`
+- `tests/test_rush_fire_timing.py`
+- `config.example.yaml`
+- `CHANGELOG.md`
+
+### Validation
+
+- Command: `.venv/bin/python -m pytest tests/ -q`
+- Result: passed (34 tests)
+- Notes: new unit tests cover the warm-up schedule math (sync-eroded budget,
+  already-late start, fire margin) and tab-prep retries; the closure-scoping
+  guard still passes.
+
+### Follow-Up Items
+
+- Next live rush: confirm `actual_fire_delay_ms` stays ~0 and
+  `warmup_completed_offset_ms` is present; check `api_search_ok_count` /
+  `api_search_fail_count` under the 15000ms timeout.
+- Merge `feature/fix-rush-race-recovery` (still unmerged) together with this
+  branch so both fix sets land on `main`.
+
+### Git
+
+- Branch: `feature/rush-fire-timing-hardening`
+- Commit: `4608153`
+- Push status: pushed
 
 ## 2026-09-12 — Rush race/retry recovery fixes
 
