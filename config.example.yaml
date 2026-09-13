@@ -42,6 +42,7 @@ settings:
   same_slot_retry_limit: 3        # Conflict retry attempts for the same slot
   same_slot_retry_budget_ms: 3000 # Total budget for same-slot conflict retries
   next_click_backoff_ms: [150, 300, 500]  # Next button short retries before fallback
+  rush_next_click_timeout_ms: 4000  # Armed observer budget for the site to re-enable Next
   rush_prefer_consecutive: 1      # Rush default: lock one slot first
   rush_selection_mode: "first_acceptable"  # first_acceptable | ranked
   rush_slot_select_timeout_ms: 200   # Wait for Next enable after slot click

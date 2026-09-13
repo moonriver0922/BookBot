@@ -24,8 +24,24 @@ All notable review and optimization changes are recorded here.
   `keepalive_session_suspect_count`). Local ops: LaunchAgent start moved
   08:18 -> 08:00 and the `caffeinate` wrapper window widened to `-t 2700` so
   the rush window stays covered.
+- Endgame ("last 100m") hardening: the 2026-09-12 post-mortem showed the
+  ~3.7s submission stall was dominated by the site's own selection-validation
+  round trip (~3s); on our side the poll-based Next retries wasted that window
+  and the JS/keyboard fallbacks could report success without a real click.
+  Next is now clicked by an in-page MutationObserver within ms of the stable
+  re-enable, verified against a submit-path request/navigation, re-armed once
+  on a fake-enable flash, and fallbacks are honest (`next_click_via`,
+  `next_click_wait_ms`, `next_click_enables`, `next_click_rearmed`,
+  `rush_next_click_timeout_ms`).
+- Wire-level timeline events from the Playwright listener
+  (`prepare_request_seen` / `prepare_response_seen` / `submit_request_seen` /
+  `submit_response_seen`, plus `*_request_seen_count` metrics); the post-Next
+  surrender now waits up to `rush_confirm_result_timeout_ms` (1500ms) for the
+  page instead of `rush_confirm_page_timeout_ms` (800ms).
 - Tests: warm-up schedule + tab-prep retry + keepalive unit tests
-  (`tests/test_rush_fire_timing.py`).
+  (`tests/test_rush_fire_timing.py`); armed Next click + network-event
+  classification (`tests/test_rush_endgame.py`); observer smoke script
+  (`tests/smoke_arm_next.py`).
 
 ## 2026-09-12
 

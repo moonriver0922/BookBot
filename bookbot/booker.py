@@ -1417,44 +1417,250 @@ async def _click_slots_js(page: Page, slots: List[TimeSlot], target: date, confi
     )
 
 
-async def _click_next_fast(page: Page, next_selector: str, backoff_ms: list[int]) -> bool:
-    """Click Next with short retries to avoid a single long blocking wait."""
-    next_ready_sel = f"{next_selector}:not([disabled]), button:has-text('Next')"
+# ── Endgame: armed Next click (2026-09-12 post-mortem) ──────────────────────
+# The site re-enables Next only after its own selection-validation round trip
+# (~3s under open congestion).  Polling from Python wastes that window, and
+# the old fallbacks could report success without a real click; the observer
+# below clicks within ms of the real enablement and the Python side verifies
+# the click produced a submit-path request or a navigation.
+_NEXT_ARM_STABILITY_MS = 120
+
+_ARM_NEXT_CLICK_JS = r"""async (args) => {
+    const { selector, timeoutMs, stabilityMs } = args;
+    const t0 = performance.now();
+    let enables = 0;
+    let wasEnabled = false;
+    let stableTimer = null;
+    let done = false;
+
+    const findBtn = () => document.querySelector(selector);
+    const isEnabled = (btn) => {
+        if (!btn) return false;
+        if (btn.disabled === true) return false;
+        if (btn.hasAttribute && btn.hasAttribute('disabled')) return false;
+        const cls = (btn.className || '').toString();
+        if (/(^|\s)(disabled|ui-state-disabled)(\s|$)/.test(cls)) return false;
+        if (btn.getAttribute && btn.getAttribute('aria-disabled') === 'true') return false;
+        return true;
+    };
+    const clickBtn = (btn) => {
+        try {
+            const rect = btn.getBoundingClientRect();
+            const cx = rect.left + rect.width / 2;
+            const cy = rect.top + rect.height / 2;
+            const opts = {bubbles: true, cancelable: true, clientX: cx, clientY: cy, button: 0};
+            btn.dispatchEvent(new PointerEvent('pointerdown', opts));
+            btn.dispatchEvent(new MouseEvent('mousedown', opts));
+            btn.dispatchEvent(new PointerEvent('pointerup', opts));
+            btn.dispatchEvent(new MouseEvent('mouseup', opts));
+            btn.dispatchEvent(new MouseEvent('click', opts));
+            return true;
+        } catch (e) {
+            try { btn.click(); return true; } catch (e2) { return false; }
+        }
+    };
+
+    return await new Promise((resolve) => {
+        const finish = (payload) => {
+            if (done) return;
+            done = true;
+            if (stableTimer !== null) clearTimeout(stableTimer);
+            mo.disconnect();
+            clearTimeout(tout);
+            resolve(Object.assign({}, payload, {
+                found: !!findBtn(),
+                enables: enables,
+                waitedMs: Math.round(performance.now() - t0),
+            }));
+        };
+
+        const observe = () => {
+            const btn = findBtn();
+            const en = isEnabled(btn);
+            if (en && !wasEnabled) {
+                enables += 1;
+                if (stableTimer !== null) clearTimeout(stableTimer);
+                stableTimer = setTimeout(() => {
+                    stableTimer = null;
+                    if (done) return;
+                    const b2 = findBtn();
+                    if (isEnabled(b2)) {
+                        finish({clicked: clickBtn(b2), via: 'armed'});
+                    }
+                }, stabilityMs);
+            } else if (!en && wasEnabled) {
+                if (stableTimer !== null) { clearTimeout(stableTimer); stableTimer = null; }
+            }
+            wasEnabled = en;
+        };
+
+        const mo = new MutationObserver(observe);
+        mo.observe(document.documentElement, {
+            subtree: true, attributes: true,
+            attributeFilter: ['disabled', 'class', 'aria-disabled'],
+            childList: true,
+        });
+        observe();
+        const tout = setTimeout(() => finish({clicked: false, via: 'timeout'}), timeoutMs);
+    });
+}"""
+
+
+async def _arm_next_click(page: Page, next_selector: str, *, timeout_ms: int) -> dict:
+    """Click Next within ms of the site (re-)enabling it, via an in-page observer."""
+    try:
+        result = await page.evaluate(
+            _ARM_NEXT_CLICK_JS,
+            {
+                "selector": next_selector,
+                "timeoutMs": int(timeout_ms),
+                "stabilityMs": _NEXT_ARM_STABILITY_MS,
+            },
+        )
+    except Exception as exc:
+        logger.debug("Arm-next observer failed: {}", exc)
+        return {"clicked": False, "via": "error", "found": False, "enables": 0, "waitedMs": 0.0}
+    if not isinstance(result, dict):
+        return {"clicked": False, "via": "invalid", "found": False, "enables": 0, "waitedMs": 0.0}
+    return result
+
+
+def _submit_requests_seen() -> int:
+    """Count prepare/submit requests observed on the wire so far this run."""
+    metrics = getattr(tracker, "_metrics", {}) or {}
+    return int(metrics.get("prepare_request_seen_count", 0) or 0) + int(
+        metrics.get("submit_request_seen_count", 0) or 0
+    )
+
+
+async def _wait_submit_effect(page: Page, baseline: int, start_url: str | None,
+                              *, timeout_ms: int = 1200) -> bool:
+    """True once a click produced evidence: a submit-path request or a navigation.
+
+    ``start_url`` must be snapshotted BEFORE the click: an effect that lands
+    before this polling starts must not look like "no effect" (the 2026-09-13
+    smoke showed that causing a needless re-arm plus an extra click).
+    """
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while time.monotonic() < deadline:
+        if _submit_requests_seen() > baseline:
+            return True
+        try:
+            if start_url is None or page.url != start_url:
+                return True
+        except Exception:
+            return True
+        await asyncio.sleep(0.05)
+    return _submit_requests_seen() > baseline
+
+
+async def _next_button_enabled(page: Page, next_selector: str) -> bool:
+    """True when the Next element exists and is currently enabled."""
+    try:
+        return bool(
+            await page.evaluate(
+                """(sel) => {
+                    const btn = document.querySelector(sel);
+                    if (!btn) return false;
+                    if (btn.disabled === true || btn.hasAttribute('disabled')) return false;
+                    return true;
+                }""",
+                next_selector,
+            )
+        )
+    except Exception:
+        return False
+
+
+def _network_event_kind(url: str) -> str | None:
+    """Classify a POSS URL into the critical-path request families we track."""
+    lower = (url or "").lower()
+    if "timetable" in lower:
+        return "search"
+    if "make_book_submit" in lower:
+        return "submit"
+    if "make_book" in lower and "submit" not in lower:
+        return "prepare"
+    return None
+
+
+async def _click_next_fast(page: Page, next_selector: str, backoff_ms: list[int],
+                           *, arm_timeout_ms: int = 4000) -> bool:
+    """Click Next the moment the site (re-)enables it — event-driven, not polled.
+
+    An in-page MutationObserver clicks within milliseconds of the real
+    enablement; if the click produces no submit-path request / navigation
+    within a short window (e.g. it landed on a brief fake-enable flash), the
+    observer is re-armed once.  Fallbacks are bounded and never report success
+    unless a real click was dispatched.
+    """
+    deadline = time.monotonic() + max(0.5, float(arm_timeout_ms) / 1000.0)
+    baseline = _submit_requests_seen()
+    rearmed = False
+    try:
+        start_url: str | None = page.url
+    except Exception:
+        start_url = None
+
+    while True:
+        remaining_ms = int(max(200.0, (deadline - time.monotonic()) * 1000.0))
+        armed = await _arm_next_click(page, next_selector, timeout_ms=remaining_ms)
+        via = str(armed.get("via") or "")
+        tracker.set_metric("next_click_via", via)
+        tracker.set_metric("next_click_wait_ms", float(armed.get("waitedMs") or 0.0))
+        tracker.set_metric("next_click_enables", int(armed.get("enables") or 0))
+
+        if armed.get("clicked"):
+            tracker.mark_event("next_click_done", via=via, waited_ms=armed.get("waitedMs"))
+            if await _wait_submit_effect(page, baseline, start_url):
+                return True
+            if rearmed or time.monotonic() >= deadline:
+                break
+            if not await _next_button_enabled(page, next_selector):
+                break
+            rearmed = True
+            tracker.set_metric("next_click_rearmed", 1)
+            logger.debug("Armed Next click had no effect — re-arming once")
+            continue
+
+        if via == "error" and await _wait_submit_effect(page, baseline, start_url, timeout_ms=600):
+            tracker.mark_event("next_click_done", via="navigation")
+            return True
+        break
+
+    # Fallback 1: bounded native retries on the exact selector.
+    ready_sel = f"{next_selector}:not([disabled])"
     for wait_ms in backoff_ms:
         try:
-            await page.wait_for_selector(
-                next_ready_sel,
-                timeout=max(100, wait_ms),
-            )
-            next_btn = page.locator(next_ready_sel).first
-            await next_btn.click(timeout=max(100, wait_ms))
+            await page.wait_for_selector(ready_sel, timeout=max(100, wait_ms))
+            await page.locator(ready_sel).first.click(timeout=max(100, wait_ms))
+            tracker.set_metric("next_click_via", "native_retry")
+            tracker.mark_event("next_click_done", via="native_retry")
             return True
         except Exception:
             logger.debug("Next not ready after {}ms, retrying …", wait_ms)
 
-    # JS fallback + keyboard submit for edge cases where click target is unstable.
+    # Fallback 2: strict JS click — only when the element exists and is enabled.
     try:
         clicked = await page.evaluate(
-            """(nextSelector) => {
-                const btn = document.querySelector(`${nextSelector}:not([disabled])`)
-                    || [...document.querySelectorAll('button')]
-                        .find(b => (b.textContent || '').trim().toLowerCase() === 'next');
+            """(sel) => {
+                const btn = document.querySelector(sel);
                 if (!btn) return false;
+                if (btn.disabled === true || btn.hasAttribute('disabled')) return false;
                 btn.click();
                 return true;
             }""",
             next_selector,
         )
         if clicked:
+            tracker.set_metric("next_click_via", "js_last_resort")
+            tracker.mark_event("next_click_done", via="js_last_resort")
             return True
     except Exception:
         pass
 
-    try:
-        await page.keyboard.press("Enter")
-        return True
-    except Exception:
-        return False
+    tracker.set_metric("next_click_via", "failed")
+    return False
 
 
 async def book_slots(page: Page, slots_to_book: List[TimeSlot], target: date, config: AppConfig,
@@ -1559,45 +1765,51 @@ async def book_slots(page: Page, slots_to_book: List[TimeSlot], target: date, co
 
     # ── Step 2: Click Next ──
     next_selector = config.selectors.next_button
-    next_btn = page.locator(f"{next_selector}:not([disabled])")
-    if await next_btn.count() == 0:
-        next_btn = page.locator('button:has-text("Next")')
-    if await next_btn.count() > 0:
-        logger.info("Clicking Next …")
-        if rush:
+    if rush:
+        # No precheck: the armed observer waits for the site's validation to
+        # re-enable Next and clicks it within ms of that moment.
+        logger.info("Clicking Next (armed) …")
+        if candidate is not None:
+            tracker.update_candidate(candidate, "next_started_ms")
+        clicked = await _click_next_fast(
+            page,
+            next_selector,
+            config.settings.next_click_backoff_ms,
+            arm_timeout_ms=int(getattr(config.settings, "rush_next_click_timeout_ms", 4000) or 4000),
+        )
+        if not clicked:
+            logger.warning("Next click failed (never became clickable within budget)")
+            tracker.add_feedback("next_not_found")
             if candidate is not None:
-                tracker.update_candidate(candidate, "next_started_ms")
-            clicked = await _click_next_fast(page, next_selector, config.settings.next_click_backoff_ms)
-            if not clicked:
-                logger.warning("Fast Next click failed")
-                tracker.add_feedback("next_not_found")
-                if candidate is not None:
-                    tracker.finish_candidate(candidate, "automation_failure")
-                return False
-        else:
-            await next_btn.first.click()
-        if rush:
-            tracker.mark_event("confirmation_page_wait_started")
+                tracker.finish_candidate(candidate, "automation_failure")
+            return False
+        tracker.mark_event("confirmation_page_wait_started")
+        try:
+            await page.wait_for_selector(
+                'input[type="checkbox"], button:has-text("Confirm"), '
+                'input[value="Confirm"], button:has-text("Submit")',
+                timeout=max(100, confirm_page_timeout),
+            )
+            tracker.mark_event("confirmation_page_seen")
+        except Exception:
+            tracker.add_feedback("confirmation_page_too_slow",
+                                 timeout_ms=confirm_page_timeout)
             try:
-                await page.wait_for_selector(
-                    'input[type="checkbox"], button:has-text("Confirm"), '
-                    'input[value="Confirm"], button:has-text("Submit")',
-                    timeout=max(100, confirm_page_timeout),
+                await page.wait_for_load_state(
+                    "domcontentloaded",
+                    timeout=max(100, confirm_result_timeout),
                 )
-                tracker.mark_event("confirmation_page_seen")
             except Exception:
-                tracker.add_feedback("confirmation_page_too_slow",
-                                     timeout_ms=confirm_page_timeout)
-                try:
-                    await page.wait_for_load_state(
-                        "domcontentloaded",
-                        timeout=max(100, confirm_page_timeout),
-                    )
-                except Exception:
-                    if candidate is not None:
-                        tracker.finish_candidate(candidate, "bot_latency_loss")
-                    return False
-        else:
+                if candidate is not None:
+                    tracker.finish_candidate(candidate, "bot_latency_loss")
+                return False
+    else:
+        next_btn = page.locator(f"{next_selector}:not([disabled])")
+        if await next_btn.count() == 0:
+            next_btn = page.locator('button:has-text("Next")')
+        if await next_btn.count() > 0:
+            logger.info("Clicking Next …")
+            await next_btn.first.click()
             await page.wait_for_load_state("networkidle")
             await human_delay(2.0, 4.0)
             await save_debug_snapshot(page, "10_next_page")
@@ -2917,15 +3129,14 @@ async def _run_booking_rush(
         async def _on_response(response) -> None:
             try:
                 url = response.url or ""
-                lower = url.lower()
-                if "timetable" in lower:
-                    req_type = "search"
-                elif "make_book_submit" in lower:
-                    req_type = "submit"
-                elif "make_book" in lower and "submit" not in lower:
-                    req_type = "prepare"
-                else:
+                req_type = _network_event_kind(url)
+                if req_type is None:
                     return
+                tracker.mark_event(
+                    f"{req_type}_response_seen",
+                    center=center_name,
+                    status=response.status,
+                )
                 network_attempt["n"] += 1
                 finished = tracker.ms_since_rush()
                 started = finished
@@ -2974,7 +3185,18 @@ async def _run_booking_rush(
             except Exception:
                 return
 
+        async def _on_request(request) -> None:
+            try:
+                req_type = _network_event_kind(request.url or "")
+                if req_type not in ("prepare", "submit"):
+                    return
+                tracker.incr_metric(f"{req_type}_request_seen_count")
+                tracker.mark_event(f"{req_type}_request_seen", center=center_name)
+            except Exception:
+                return
+
         tab.on("response", lambda resp: asyncio.create_task(_on_response(resp)))
+        tab.on("request", lambda req: asyncio.create_task(_on_request(req)))
 
     for cn, tab in center_tabs:
         _attach_network_listener(tab, cn)

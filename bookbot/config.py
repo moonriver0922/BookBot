@@ -145,6 +145,7 @@ class Settings:
     same_slot_retry_limit: int = 3
     same_slot_retry_budget_ms: int = 3000
     next_click_backoff_ms: List[int] = field(default_factory=lambda: [150, 300, 500])
+    rush_next_click_timeout_ms: int = 4000
     booking_mode: str = "ui"
     rush_time_sync_enabled: bool = True
     rush_time_sync_samples: int = 5
