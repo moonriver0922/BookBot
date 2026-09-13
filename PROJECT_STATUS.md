@@ -63,6 +63,60 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 
 ## Recent Stage History
 
+## 2026-09-13 — Endgame (last-100m) hardening
+
+### Completed
+
+- Wire-level post-mortem of the 2026-09-12 loss: the network listener shows the
+  site's own slot-validation round trip (make_book.do -> 302) took ~3.1s before
+  Next re-enabled; the real submit (make_book_submit.do -> 200) left at
+  ~T+15.1s and came back a conflict. Our poll-based Next retries burned that
+  window and the JS/keyboard fallbacks could report success without a real
+  click.
+- `_click_next_fast` rewritten as an armed, event-driven click: an in-page
+  MutationObserver clicks within ms of the stable re-enable, the click is
+  verified against a submit-path request / navigation, re-armed once on a
+  fake-enable flash, and fallbacks never report success without a dispatched
+  click (`next_click_via`, `next_click_wait_ms`, `next_click_enables`,
+  `next_click_rearmed`, `rush_next_click_timeout_ms`).
+- Wire instrumentation: `prepare_request_seen` / `prepare_response_seen` /
+  `submit_request_seen` / `submit_response_seen` timeline events plus
+  `*_request_seen_count` metrics; post-Next surrender now waits up to
+  `rush_confirm_result_timeout_ms` (1500ms) for the page.
+- Smoke testing caught and fixed an effect-snapshot bug (a click whose effect
+  landed before the poll started was misread as "no effect", triggering a
+  needless re-arm + extra click).
+
+### Changed Files
+
+- `bookbot/booker.py`
+- `bookbot/config.py`
+- `config.example.yaml`
+- `tests/test_rush_endgame.py`
+- `tests/smoke_arm_next.py`
+- `CHANGELOG.md`
+
+### Validation
+
+- Command: `.venv/bin/python -m pytest tests/ -q`
+- Result: passed (48 tests)
+- Notes: headless-chromium smoke (delayed / immediate / ignored-first-click
+  re-arm / never-enabled) passes; the re-arm path clicks exactly twice (one
+  ignored + one landing).
+
+### Follow-Up Items
+
+- Next rush: read `next_click_wait_ms` / `next_click_via` / `next_click_enables`
+  to calibrate the stability gate against real enable->click latency.
+- Consider the API submit canary (skips the UI validation chain) once payloads
+  are validated against live responses.
+
+### Git
+
+- Branch: `feature/rush-fire-timing-hardening`
+- Commit: `84d8c12`
+- Push status: pushed
+
 ## 2026-09-13 — Fire-timing hardening (never fire late)
 
 ### Completed
