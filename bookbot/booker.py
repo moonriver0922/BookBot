@@ -90,6 +90,78 @@ async def _retry_tab_prep(
     assert last_exc is not None
     raise last_exc
 
+# Keepalive for long pre-open waits (2026-09-13: start moved to 08:00): ping
+# each tab's session every few minutes so a ~30-min idle window cannot expire
+# the POSS session before the rush.
+_KEEPALIVE_CHUNK_S = 240.0
+_KEEPALIVE_TAIL_GUARD_S = 30.0
+_KEEPALIVE_PING_TIMEOUT_S = 10.0
+
+_KEEPALIVE_PING_JS = """async () => {
+    try {
+        const r = await fetch(window.location.href, {
+            method: 'HEAD', credentials: 'same-origin', cache: 'no-store',
+        });
+        return {ok: true, status: r.status, redirected: r.redirected, url: r.url};
+    } catch (e) {
+        return {ok: false, status: 0, redirected: false, url: ''};
+    }
+}"""
+
+
+def _keepalive_next_step(
+    remaining_s: float,
+    *,
+    chunk_s: float = _KEEPALIVE_CHUNK_S,
+    tail_guard_s: float = _KEEPALIVE_TAIL_GUARD_S,
+) -> float:
+    """Seconds to sleep before the next keepalive check (0 = go straight to tail)."""
+    return min(float(chunk_s), max(0.0, float(remaining_s) - float(tail_guard_s)))
+
+
+async def _keepalive_ping(center_tabs: list[tuple[str, Page]]) -> int:
+    """One lightweight HEAD ping per tab so the POSS session does not idle out.
+
+    Returns the number of tabs that looked redirected to login (session risk).
+    """
+    tracker.incr_metric("keepalive_ping_count")
+    suspicious = 0
+    for center_name, tab in center_tabs:
+        try:
+            result = await asyncio.wait_for(
+                tab.evaluate(_KEEPALIVE_PING_JS),
+                timeout=_KEEPALIVE_PING_TIMEOUT_S,
+            )
+        except Exception as exc:
+            logger.debug("Keepalive ping failed for {}: {}", center_name, exc)
+            continue
+        if not isinstance(result, dict):
+            continue
+        url = str(result.get("url") or "")
+        if bool(result.get("redirected")) or "login" in url.lower():
+            suspicious += 1
+            tracker.incr_metric("keepalive_session_suspect_count")
+            logger.warning(
+                "Keepalive ping for {} may have lost the session (redirected={}, url={})",
+                center_name, result.get("redirected"), url,
+            )
+    return suspicious
+
+
+async def _sleep_with_keepalive(center_tabs: list[tuple[str, Page]], total_s: float) -> None:
+    """Sleep out the pre-rush wait in chunks, pinging tabs to keep the session warm."""
+    deadline = time.monotonic() + max(0.0, float(total_s))
+    while True:
+        step = _keepalive_next_step(deadline - time.monotonic())
+        if step <= 0.0:
+            break
+        await asyncio.sleep(step)
+        if deadline - time.monotonic() > _KEEPALIVE_TAIL_GUARD_S:
+            await _keepalive_ping(center_tabs)
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        await asyncio.sleep(remaining)
+
 
 def _selector_id(selector: str) -> str:
     return selector[1:] if selector.startswith("#") else selector
@@ -2766,7 +2838,7 @@ async def _run_booking_rush(
     if remaining_pre_fire_s > 3.0:
         sleep_before_warm, _ = _warmup_schedule_s(remaining_pre_fire_s)
         logger.info("Sleeping {:.0f}s before warm-up …", sleep_before_warm)
-        await asyncio.sleep(sleep_before_warm)
+        await _sleep_with_keepalive(center_tabs, sleep_before_warm)
 
         now_srv = datetime.now() + timedelta(milliseconds=server_delta_ms)
         _, warmup_cap_s = _warmup_schedule_s((target_fire_srv - now_srv).total_seconds())

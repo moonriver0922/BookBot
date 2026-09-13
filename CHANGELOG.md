@@ -18,7 +18,13 @@ All notable review and optimization changes are recorded here.
 - Raise `api.request_timeout_ms` 2500 -> 15000 (example + live): open-time
   server latency exceeds the old timeout, so every API wave timed out on
   2026-09-13.
-- Tests: warm-up schedule + tab-prep retry unit tests
+- Keep the POSS session warm during long pre-open waits: the wait before the
+  rush is chunked with a lightweight HEAD ping per tab every ~4 min
+  (`keepalive_ping_count`; a login redirect raises
+  `keepalive_session_suspect_count`). Local ops: LaunchAgent start moved
+  08:18 -> 08:00 and the `caffeinate` wrapper window widened to `-t 2700` so
+  the rush window stays covered.
+- Tests: warm-up schedule + tab-prep retry + keepalive unit tests
   (`tests/test_rush_fire_timing.py`).
 
 ## 2026-09-12

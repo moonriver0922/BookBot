@@ -97,3 +97,75 @@ class TestRetryTabPrep:
         with pytest.raises(ValueError):
             asyncio.run(booker._retry_tab_prep(make, attempts=3, delay_s=0.05))
         assert time.monotonic() - start >= 0.09
+
+
+class FakePingTab:
+    def __init__(self, result):
+        self._result = result
+        self.calls = 0
+
+    async def evaluate(self, script, *args):
+        self.calls += 1
+        return self._result
+
+
+class TestKeepalive:
+    def test_next_step_caps_at_chunk(self):
+        assert booker._keepalive_next_step(1000.0) == pytest.approx(240.0)
+
+    def test_next_step_shrinks_near_tail(self):
+        assert booker._keepalive_next_step(100.0) == pytest.approx(70.0)
+
+    def test_next_step_zero_inside_tail_guard(self):
+        assert booker._keepalive_next_step(30.0) == 0.0
+        assert booker._keepalive_next_step(0.0) == 0.0
+        assert booker._keepalive_next_step(-5.0) == 0.0
+
+    def test_ping_calls_every_tab_and_reports_clean(self):
+        tabs = [
+            (
+                "A",
+                FakePingTab(
+                    {
+                        "ok": True,
+                        "status": 200,
+                        "redirected": False,
+                        "url": "https://x/make_book.do",
+                    }
+                ),
+            ),
+            (
+                "B",
+                FakePingTab(
+                    {
+                        "ok": True,
+                        "status": 200,
+                        "redirected": False,
+                        "url": "https://x/make_book.do",
+                    }
+                ),
+            ),
+        ]
+        suspicious = asyncio.run(booker._keepalive_ping(tabs))
+        assert suspicious == 0
+        assert all(tab.calls == 1 for _, tab in tabs)
+
+    def test_ping_flags_redirect_to_login(self):
+        tab = FakePingTab(
+            {
+                "ok": True,
+                "status": 200,
+                "redirected": True,
+                "url": "https://x/poss/secure/login/loginhome.do",
+            }
+        )
+        suspicious = asyncio.run(booker._keepalive_ping([("A", tab)]))
+        assert suspicious == 1
+
+    def test_ping_swallows_tab_errors(self):
+        class BoomTab:
+            async def evaluate(self, script, *args):
+                raise RuntimeError("page crashed")
+
+        suspicious = asyncio.run(booker._keepalive_ping([("A", BoomTab())]))
+        assert suspicious == 0
