@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, Awaitable, Callable, List, Tuple, TypeVar
 
 from loguru import logger
 
@@ -40,6 +40,55 @@ RUNTIME_LOG_PATH = Path("logs/runtime.jsonl")
 # later is recorded as out-of-window instead of being snapped to the latest
 # probe (which would corrupt `bookbot timing-report` recommendations).
 BOUNDARY_SNAP_TOLERANCE_MS = 750
+
+# Warm-up scheduling (2026-09-13): the pre-open warm-up must never be able to
+# delay the fire. Aim to finish it well before the first fire offset, and
+# hard-abandon it on overrun - a late fire costs the whole rush.
+_RUSH_WARMUP_LEAD_S = 10.0
+_RUSH_WARMUP_FIRE_MARGIN_S = 1.0
+
+T = TypeVar("T")
+
+
+def _warmup_schedule_s(
+    remaining_s: float,
+    *,
+    lead_s: float = _RUSH_WARMUP_LEAD_S,
+    fire_margin_s: float = _RUSH_WARMUP_FIRE_MARGIN_S,
+) -> tuple[float, float]:
+    """Return ``(sleep_before_warm_s, warmup_cap_s)`` for the time left.
+
+    ``sleep_before_warm_s`` waits, then starts the warm-up so it gets at most
+    ``lead_s`` seconds before the fire target. ``warmup_cap_s`` is the hard
+    ceiling for the warm-up itself: it is always abandoned early enough to
+    keep ``fire_margin_s`` in hand before the fire target.
+    """
+    sleep_before_warm_s = max(0.0, float(remaining_s) - float(lead_s))
+    warmup_cap_s = max(0.5, float(remaining_s) - float(fire_margin_s))
+    return sleep_before_warm_s, warmup_cap_s
+
+
+async def _retry_tab_prep(
+    make_tab: Callable[[], Awaitable[T]],
+    *,
+    attempts: int = 3,
+    delay_s: float = 1.5,
+    on_retry: Callable[[int, Exception], None] | None = None,
+) -> T:
+    """Retry tab preparation on transient failures; caller builds a fresh tab."""
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await make_tab()
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= attempts:
+                break
+            if on_retry is not None:
+                on_retry(attempt, exc)
+            await asyncio.sleep(delay_s)
+    assert last_exc is not None
+    raise last_exc
 
 
 def _selector_id(selector: str) -> str:
@@ -2567,15 +2616,42 @@ async def _run_booking_rush(
     skipped_centers_due_to_deadline = 0
 
     with tracker.step("rush_prepare_tabs"):
-        async def _prep_extra_tab(cname: str) -> tuple[str, Page]:
+        async def _prep_extra_tab_once(cname: str) -> tuple[str, Page]:
             tab = await context.new_page()
-            await tab.goto(BOOKING_URL, wait_until="domcontentloaded")
-            await _ensure_booking_form(tab, config, rush=True)
-            await select_booking_criteria(
-                tab, ref_date, config,
-                center_override=cname, auto_search=False, rush=True,
-            )
+            try:
+                await tab.goto(BOOKING_URL, wait_until="domcontentloaded")
+                await _ensure_booking_form(tab, config, rush=True)
+                await select_booking_criteria(
+                    tab, ref_date, config,
+                    center_override=cname, auto_search=False, rush=True,
+                )
+            except Exception:
+                try:
+                    await tab.close()
+                except Exception:
+                    pass
+                raise
             return cname, tab
+
+        async def _prep_extra_tab(cname: str) -> tuple[str, Page]:
+            attempts = 3
+
+            def _note_retry(attempt: int, exc: Exception) -> None:
+                tracker.incr_metric("prep_tab_retry_count")
+                logger.warning(
+                    "Retrying tab prep for {} (attempt {}/{}): {}",
+                    cname, attempt + 1, attempts, exc,
+                )
+
+            # Transient prep failures used to cost a whole center for the rush
+            # (2026-09-13 lost Sports Practice Hall this way); the pre-open
+            # window is minutes long, so retry with a fresh tab.
+            return await _retry_tab_prep(
+                lambda: _prep_extra_tab_once(cname),
+                attempts=attempts,
+                delay_s=1.5,
+                on_retry=_note_retry,
+            )
 
         await select_booking_criteria(
             page, ref_date, config,
@@ -2668,7 +2744,6 @@ async def _run_booking_rush(
     # ── Phase 2: Wait with lightweight warm-up (forms stay filled) ──
     now = datetime.now()
     target_dt = now.replace(hour=rush_time[0], minute=rush_time[1], second=rush_time[2], microsecond=0)
-    secs_to_rush = (target_dt - now).total_seconds()
     pre_fire_ms = config.settings.rush_pre_fire_ms
     boundary_offsets = normalize_boundary_offsets(
         list(getattr(config.settings, "rush_boundary_offsets_ms", []) or []),
@@ -2681,14 +2756,38 @@ async def _run_booking_rush(
     tracker.set_metric("boundary_offsets_ms", boundary_offsets)
     tracker.set_metric("rush_boundary_enabled", bool(getattr(config.settings, "rush_boundary_enabled", True)))
 
-    if secs_to_rush > 7:
-        sleep_before_warm = secs_to_rush - 5
+    # Recompute the remaining time AFTER the server-time sync: the sync can
+    # take seconds and used to silently consume the warm-up budget (which was
+    # measured before the sync), pushing the 2026-09-13 fire ~4.2s late.
+    target_fire_srv = target_dt + timedelta(milliseconds=first_offset_ms)
+    now_srv = datetime.now() + timedelta(milliseconds=server_delta_ms)
+    remaining_pre_fire_s = (target_fire_srv - now_srv).total_seconds()
+
+    if remaining_pre_fire_s > 3.0:
+        sleep_before_warm, _ = _warmup_schedule_s(remaining_pre_fire_s)
         logger.info("Sleeping {:.0f}s before warm-up …", sleep_before_warm)
         await asyncio.sleep(sleep_before_warm)
 
+        now_srv = datetime.now() + timedelta(milliseconds=server_delta_ms)
+        _, warmup_cap_s = _warmup_schedule_s((target_fire_srv - now_srv).total_seconds())
         with tracker.step("warm_connections"):
-            await _warm_connections(center_tabs, mode=config.settings.rush_warmup_mode)
+            try:
+                await asyncio.wait_for(
+                    _warm_connections(center_tabs, mode=config.settings.rush_warmup_mode),
+                    timeout=warmup_cap_s,
+                )
+            except asyncio.TimeoutError:
+                tracker.incr_metric("warmup_timeout_count")
+                logger.warning(
+                    "Warm-up exceeded its {:.1f}s budget - abandoning it to keep the fire on time",
+                    warmup_cap_s,
+                )
         tracker.mark_event("connection_warmup_completed")
+        warm_done_srv = datetime.now() + timedelta(milliseconds=server_delta_ms)
+        tracker.set_metric(
+            "warmup_completed_offset_ms",
+            round((warm_done_srv - target_dt).total_seconds() * 1000.0, 1),
+        )
 
         await _async_wait_until_with_offset(
             *rush_time,
@@ -3096,21 +3195,32 @@ async def _run_booking_rush(
             target = target_dates[0]
             payload = _build_search_payload_from_state(state, target)
             t0 = time.monotonic()
+            started_ms = tracker.ms_since_rush()
             tracker.incr_metric("api_search_attempt_count")
             result = await api_client.search(csrf_token=csrf, payload=payload)
             rtt_ms = round((time.monotonic() - t0) * 1000.0, 1)
+            finished_ms = tracker.ms_since_rush()
             tracker.record_network(
                 request_type="search",
                 status_code=result.status_code,
-                request_started_ms=tracker.ms_since_rush(),
-                response_finished_ms=tracker.ms_since_rush(),
+                request_started_ms=started_ms,
+                response_finished_ms=finished_ms,
+                response_size=len(result.text or ""),
                 center=center_name,
                 attempt=int(tracker._metrics.get("api_search_attempt_count", 0) or 0),
                 url=config.api.search_endpoint,
             )
             if not result.ok or result.payload is None:
                 tracker.incr_metric("api_search_fail_count")
+                logger.warning(
+                    "API search failed for {} (status={}, rtt={}ms): {}",
+                    center_name,
+                    result.status_code,
+                    rtt_ms,
+                    (result.error or "no payload")[:160],
+                )
                 return None
+            tracker.incr_metric("api_search_ok_count")
             parsed = parse_timetable_payload(
                 result.payload,
                 center_name=center_name,

@@ -2,6 +2,25 @@
 
 All notable review and optimization changes are recorded here.
 
+## 2026-09-13
+
+- Never fire late: recompute the warm-up schedule after the server-time sync
+  and hard-cap the warm-up (`asyncio.wait_for`, >=1s fire margin). The
+  2026-09-13 rush fired ~4.2s late because the sync ate the warm-up budget
+  and the slow pre-open server stretched the warm-up to 5.6s
+  (`warmup_timeout_count`, `warmup_completed_offset_ms`).
+- Retry extra-center tab prep (3 attempts, fresh tab): a transient prep
+  timeout cost the Sports Practice Hall tab on 2026-09-13
+  (`prep_tab_retry_count`).
+- Log API Search failures with status/error; record real network
+  start/finish timestamps (rtt was stuck at 0.0) and add
+  `api_search_ok_count`.
+- Raise `api.request_timeout_ms` 2500 -> 15000 (example + live): open-time
+  server latency exceeds the old timeout, so every API wave timed out on
+  2026-09-13.
+- Tests: warm-up schedule + tab-prep retry unit tests
+  (`tests/test_rush_fire_timing.py`).
+
 ## 2026-09-12
 
 - Fix `_api_search_wave` crash: `booking_claimed` was assigned inside the

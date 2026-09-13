@@ -77,7 +77,7 @@ api:
   search_endpoint: "/starspossfbstud/secure/ui_make_book/timetable.json"
   prepare_endpoint: "/starspossfbstud/secure/ui_make_book/make_book.do"
   submit_endpoint: "/starspossfbstud/secure/ui_make_book/make_book_submit.do"
-  request_timeout_ms: 2500
+  request_timeout_ms: 15000      # >= open-time server latency (can exceed 10s); 2500 cut the API race short
   retry_count: 2
   rush_search_race: true          # Race API Search with UI at open
   submit_canary: false            # true = try API prepare/submit after API Search hit
