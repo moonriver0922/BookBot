@@ -63,6 +63,43 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 
 ## Recent Stage History
 
+## 2026-09-14 (evening) — CSRF token freshness (403 blackout fix)
+
+### Completed
+
+- Forensics on the morning's win: the run succeeded despite a ~59s search
+  blackout.  The POSS booking page freezes `CSRFToken: getCSRFToken()` into
+  the Search click handler at page load, so the 08:00-prepared form held a
+  token the server had stopped accepting: every search - both browser tabs
+  AND the httpx API race (which reused the prep-time snapshot) - returned 403
+  until a retry wave rebuilt the page at +56s and re-bound a fresh token
+  (+59.1s -> 200 -> booked).  (2026-09-12 worked only because the
+  prep-to-fire gap was ~11 min.)
+- Live off-peak probes: fresh token -> 200; dead token -> 403 (httpx is NOT
+  blocked - the API channel never had a fingerprint problem); continuous use
+  keeps the token alive 40+ min; idle 29.5 min did NOT die off-peak, so the
+  production trigger is not fully pinned - the fix is trigger-agnostic.
+- Fix, three layers + two hardenings:
+  1. Pre-fire form refresh: both booking tabs are re-rendered at fire-150s
+     (`rush_form_refresh_before_s`, bounded budget, never delays the fire).
+  2. API race reads the tab's CSRFToken at wave time (not the prep snapshot)
+     and retries once on 403 with a re-read/render token.
+  3. 403 heal: the first search 403 triggers an immediate rebuild + refire
+     (max 2 rounds, 8s cooldown) instead of a ~59s wait.
+  4. `_open_sports_facility_panel`: bounded click retries + JS-click
+     fallback - a single click after page load can silently no-op while the
+     page JS initializes (rebuilds stalled ~20s and failed; found while
+     validating live, re-verified live: rebuild + refire succeeds from both
+     the pre-fire and post-search states).
+  5. `scan_available_slots_multi` tolerates a mid-scan navigation.
+- Tests: 72/72 (`tests/test_token_freshness.py`, 24 new cases).
+
+### Git
+
+- Branch: `feature/token-freshness`
+- Commit: `565d362`
+- Push status: pushed
+
 ## 2026-09-14 — Live validation: first win on the hardened build
 
 ### Completed
