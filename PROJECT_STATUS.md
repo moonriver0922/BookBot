@@ -63,6 +63,27 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 
 ## Recent Stage History
 
+## 2026-09-14 — Live validation: first win on the hardened build
+
+### Completed
+
+- Run `20260914-080007-7211` (git `6754dcb`) — **SUCCESS**: booked 2026-09-21
+  09:30–10:30 @ Shaw Sports Complex (wave 3, relaxed=False).
+- Fire timing held: `actual_fire_delay_ms=1.5` (vs 4.2s late on 2026-09-13);
+  warmup ready 9.96s before open; keepalive 7 pings during the 28-min wait.
+- Endgame (last-100m fix): slot seen -> booked in 351ms — `next_click_via=armed`,
+  site validation round trip 48ms, submit response 21ms (vs 3.68s on 2026-09-12).
+- Server slower than ever (first search response 8.7s, timetable parseable at
+  43.4s, first acceptable slot at +59.5s); retry wave 3 caught it.
+- New issue logged: API race channel returned 403 on all 8 attempts (UI carried
+  the win; investigate session/anti-bot separately).
+
+### Git
+
+- Branch: `feature/rush-fire-timing-hardening`
+- Build validated: `6754dcb`
+- Push status: pushed
+
 ## 2026-09-13 — Endgame (last-100m) hardening
 
 ### Completed
