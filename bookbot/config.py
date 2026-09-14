@@ -56,6 +56,7 @@ DEFAULTS = {
         "rush_slot_select_timeout_ms": 200,
         "rush_confirm_page_timeout_ms": 800,
         "rush_confirm_result_timeout_ms": 1500,
+        "rush_form_refresh_before_s": 150.0,
         "experiment_id": "baseline",
         "strategy_version": "rush-adaptive-v1",
     },
@@ -155,6 +156,7 @@ class Settings:
     rush_slot_select_timeout_ms: int = 200
     rush_confirm_page_timeout_ms: int = 800
     rush_confirm_result_timeout_ms: int = 1500
+    rush_form_refresh_before_s: float = 150.0
     experiment_id: str = "baseline"
     strategy_version: str = "rush-adaptive-v1"
 

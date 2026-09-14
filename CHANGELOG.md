@@ -2,6 +2,37 @@
 
 All notable review and optimization changes are recorded here.
 
+## 2026-09-14
+
+- CSRF token freshness (root cause of the run's ~59s search blackout): the
+  POSS booking page freezes `CSRFToken: getCSRFToken()` into the Search click
+  handler at page load, so the 08:00-prepared form held a token the server
+  stopped accepting.  Every search - both browser tabs and the httpx API race
+  (which reused the prep-time token) - returned 403 until a retry wave
+  rebuilt the page and re-bound a fresh token.  Live off-peak probe: fresh
+  token -> 200, dead token -> 403, a page re-render returns the current
+  token, and the HTTP layer itself is not blocked (httpx works with a fresh
+  token).
+- Pre-fire form refresh: both booking tabs are re-rendered at fire-150s
+  (`rush_form_refresh_before_s`, bounded budget, never delays the fire) so
+  the fire runs with a fresh token binding; the API race now reads the
+  CSRFToken from the tab at wave time instead of the prep-time snapshot.
+- 403 heal: the first search 403 triggers an immediate rebuild + refire
+  (max 2 rounds, 8s cooldown) instead of waiting ~59s for the retry waves
+  (`search_403_count`, `search_403_heal_count` / `_refire` / `_fail`;
+  the 2026-09-14 run recovered only at +59s through this path by accident).
+- Scan hardening: `scan_available_slots_multi` tolerates a tab being
+  navigated mid-scan by a concurrent rebuild.
+- Form rebuild reliability: `_open_sports_facility_panel` retries the
+  Sports Facility toggle (bounded) with a JS-click fallback.  A single click
+  right after a page load can silently no-op while the page JS is still
+  initializing; rebuilds then stalled ~20s and failed (found while
+  validating the refresh/heal paths against the live site, fixed and
+  re-verified live: rebuild + refire now succeeds from both the pre-fire and
+  post-search states).
+- Tests: token freshness suite `tests/test_token_freshness.py` (refresh plan
+  bounds, form rebuild sequence, tab token read, heal round, API 403 retry).
+
 ## 2026-09-13
 
 - Never fire late: recompute the warm-up schedule after the server-time sync

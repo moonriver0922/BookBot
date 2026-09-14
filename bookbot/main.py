@@ -49,6 +49,7 @@ async def execute(
             "rush_selection_mode": config.settings.rush_selection_mode,
             "rush_slot_select_timeout_ms": config.settings.rush_slot_select_timeout_ms,
             "rush_confirm_page_timeout_ms": config.settings.rush_confirm_page_timeout_ms,
+            "rush_form_refresh_before_s": config.settings.rush_form_refresh_before_s,
             "experiment_id": config.settings.experiment_id,
             "strategy_version": config.settings.strategy_version,
             "api_enabled": config.api.enabled,

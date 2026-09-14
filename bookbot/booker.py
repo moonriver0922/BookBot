@@ -90,6 +90,159 @@ async def _retry_tab_prep(
     assert last_exc is not None
     raise last_exc
 
+# CSRF freshness (2026-09-14): the site freezes ``CSRFToken: getCSRFToken()``
+# into the Search click handler at page load, so a form rendered ~30 min before
+# the rush carries a token the server no longer accepts - every search then
+# returns 403 until the page is re-rendered (browser and API alike).  The form
+# is re-rendered shortly before the fire, and a 403 that still slips through
+# triggers an immediate rebuild + refire instead of waiting on retry waves.
+_RUSH_FORM_REFRESH_FIRE_MARGIN_S = 30.0
+_RUSH_FORM_REFRESH_MIN_BUDGET_S = 5.0
+_RUSH_FORM_REFRESH_MAX_BUDGET_S = 60.0
+_RUSH_FORM_REFRESH_SKIP_BELOW_S = 45.0
+_RUSH_FORM_REBUILD_TIMEOUT_MS = 12_000
+_RUSH_TOKEN_HEAL_MAX_ROUNDS = 2
+_RUSH_TOKEN_HEAL_COOLDOWN_S = 8.0
+
+
+def _refresh_plan_s(
+    remaining_s: float,
+    *,
+    before_s: float,
+    min_margin_s: float = _RUSH_FORM_REFRESH_FIRE_MARGIN_S,
+    max_budget_s: float = _RUSH_FORM_REFRESH_MAX_BUDGET_S,
+    skip_below_s: float = _RUSH_FORM_REFRESH_SKIP_BELOW_S,
+) -> tuple[float, float] | None:
+    """Return ``(sleep_before_refresh_s, refresh_budget_s)`` or None to skip.
+
+    The refresh re-renders each booking tab so the site re-binds a fresh
+    CSRFToken.  It must finish well before the fire: the budget is capped and
+    always keeps ``min_margin_s`` in hand.  Too close to the fire (or disabled
+    with ``before_s <= 0``) the refresh is skipped - the 403 heal path then
+    covers recovery.
+    """
+    if before_s <= 0 or remaining_s <= skip_below_s:
+        return None
+    sleep_s = max(0.0, float(remaining_s) - float(before_s))
+    budget_s = min(
+        float(max_budget_s), float(remaining_s) - sleep_s - float(min_margin_s)
+    )
+    if budget_s < _RUSH_FORM_REFRESH_MIN_BUDGET_S:
+        return None
+    return sleep_s, budget_s
+
+
+async def _read_tab_csrf_token(tab: Page) -> str:
+    """Read the booking form's current CSRFToken value from a tab."""
+    try:
+        value = await tab.evaluate(
+            """() => document.querySelector('input[name="CSRFToken"], input[name="csrfToken"]')?.value || ''"""
+        )
+    except Exception:
+        return ""
+    return value if isinstance(value, str) else ""
+
+
+async def _fetch_fresh_csrf_token(tab: Page) -> str:
+    """GET the booking form in-page and parse the current CSRFToken value.
+
+    Cheap token refresh for the API search channel (no page reload needed -
+    only the token value matters there).  Returns "" on failure.
+    """
+    try:
+        res = await tab.evaluate(
+            """async () => {
+                try {
+                    const r = await fetch(window.location.href, {method: 'GET', credentials: 'same-origin', cache: 'no-store'});
+                    const t = await r.text();
+                    const m = t.match(/name=["']CSRFToken["'][^>]*value=["']([^"']+)/i)
+                           || t.match(/value=["']([^"']+)["'][^>]*name=["']CSRFToken["']/i);
+                    return {status: r.status, token: m ? m[1] : ''};
+                } catch (e) { return {status: 0, token: ''}; }
+            }"""
+        )
+    except Exception:
+        return ""
+    if not isinstance(res, dict):
+        return ""
+    token = res.get("token")
+    return token if isinstance(token, str) else ""
+
+
+async def _rebuild_rush_form_tab(
+    tab: Page,
+    config: AppConfig,
+    *,
+    ref_date: date,
+    center_name: str,
+) -> None:
+    """Re-render the booking form so the site re-binds a fresh CSRFToken.
+
+    The POSS Search click handler captures ``CSRFToken: getCSRFToken()`` at
+    page load; once that token ages out every search returns 403 until the
+    page is reloaded.  Reloading resets the form, so the criteria are
+    re-selected afterwards.
+    """
+    await tab.goto(
+        BOOKING_URL,
+        wait_until="domcontentloaded",
+        timeout=_RUSH_FORM_REBUILD_TIMEOUT_MS,
+    )
+    await _ensure_booking_form(tab, config, rush=True)
+    await select_booking_criteria(
+        tab, ref_date, config,
+        center_override=center_name, auto_search=False, rush=True,
+    )
+
+
+async def _token_heal_round(
+    center_tabs: list[tuple[str, Page]],
+    config: AppConfig,
+    *,
+    ref_date: date,
+    is_stopped: Callable[[], bool] | None = None,
+) -> tuple[int, int]:
+    """Rebuild + refire every tab after a stale-token 403. Returns (ok, failed)."""
+    ok_count = 0
+    fail_count = 0
+    for center_name, tab in center_tabs:
+        if is_stopped is not None and is_stopped():
+            break
+        try:
+            await _rebuild_rush_form_tab(
+                tab, config, ref_date=ref_date, center_name=center_name,
+            )
+            search_id = _selector_id(config.selectors.search_button)
+            await tab.evaluate(f"document.getElementById('{search_id}')?.click()")
+            ok_count += 1
+        except Exception as exc:
+            fail_count += 1
+            logger.warning("Token heal rebuild failed for {}: {}", center_name, exc)
+    return ok_count, fail_count
+
+
+async def _api_search_with_fresh_token(
+    client,
+    tab: Page | None,
+    *,
+    csrf_token: str,
+    payload: dict,
+):
+    """API search that retries once with a freshly read / minted token on 403."""
+    result = await client.search(csrf_token=csrf_token, payload=payload)
+    if result.status_code == 403:
+        tracker.incr_metric("api_search_403_count")
+        if tab is not None:
+            fresh = await _read_tab_csrf_token(tab)
+            if not fresh or fresh == csrf_token:
+                fresh = await _fetch_fresh_csrf_token(tab)
+            if fresh and fresh != csrf_token:
+                result = await client.search(csrf_token=fresh, payload=payload)
+                if result.ok and result.payload is not None:
+                    tracker.incr_metric("api_search_token_retry_ok_count")
+    return result
+
+
 # Keepalive for long pre-open waits (2026-09-13: start moved to 08:00): ping
 # each tab's session every few minutes so a ~30-min idle window cannot expire
 # the POSS session before the rush.
@@ -964,7 +1117,12 @@ async def scan_available_slots_multi(
     logger.info("Scanning timetable for {} dates at {} …", len(targets), center_name)
 
     script, args = _extract_timetable_data_js(config)
-    timetable_data = await page.evaluate(script, args)
+    try:
+        timetable_data = await page.evaluate(script, args)
+    except Exception as exc:
+        # A concurrent rebuild/heal can navigate the tab mid-scan.
+        logger.debug("Timetable scan skipped (page busy): {}", exc)
+        return {}
 
     if not timetable_data:
         logger.warning("Could not parse timetable structure")
@@ -1937,7 +2095,6 @@ async def _ensure_booking_form(page: Page, config: AppConfig, *, rush: bool = Fa
     search_date_id = _selector_id(config.selectors.search_date)
     center_id = _selector_id(config.selectors.center)
     search_button_id = _selector_id(config.selectors.search_button)
-    sports_sel = config.selectors.sports_facility_button
 
     actv = page.locator(activity_sel)
     if await actv.count() > 0:
@@ -1948,34 +2105,15 @@ async def _ensure_booking_form(page: Page, config: AppConfig, *, rush: bool = Fa
             pass
         logger.debug("Booking form exists in DOM but is NOT visible — need to click Sports Facility")
 
-    sports_btn = page.locator(sports_sel)
-    if await sports_btn.count() > 0:
-        logger.debug("Clicking Sports Facility button …")
-        await sports_btn.first.click()
-        if rush:
-            try:
-                await page.wait_for_selector(activity_sel, state="visible", timeout=10_000)
-            except Exception:
-                await page.wait_for_load_state("domcontentloaded", timeout=5_000)
-        else:
-            await page.wait_for_load_state("networkidle")
-            await human_delay(1.5, 2.5)
-    else:
-        logger.debug("No Sports Facility button found, re-navigating …")
+    opened = await _open_sports_facility_panel(page, config, rush=rush)
+    if not opened:
+        logger.debug("Sports Facility panel did not open, re-navigating …")
         await page.goto(BOOKING_URL, wait_until="domcontentloaded")
         if not rush:
             await human_delay(1.0, 2.0)
-        sports_btn = page.locator(sports_sel)
-        if await sports_btn.count() > 0:
-            await sports_btn.first.click()
-            if rush:
-                try:
-                    await page.wait_for_selector(activity_sel, state="visible", timeout=10_000)
-                except Exception:
-                    await page.wait_for_load_state("domcontentloaded", timeout=5_000)
-            else:
-                await page.wait_for_load_state("networkidle")
-                await human_delay(1.5, 2.5)
+        opened = await _open_sports_facility_panel(page, config, rush=rush)
+        if not opened:
+            logger.debug("Sports Facility panel still closed after re-navigation")
 
     if await page.locator(activity_sel).count() == 0:
         from bookbot.auth import is_maintenance_page, MaintenanceError
@@ -1995,10 +2133,77 @@ async def _ensure_booking_form(page: Page, config: AppConfig, *, rush: bool = Fa
                 const visible = (el) => !!(el.offsetParent || el.getClientRects().length);
                 return visible(dateInput) && visible(actv) && visible(ctr) && !search.disabled;
             }}""",
-            timeout=5_000 if rush else 10_000,
+            timeout=8_000 if rush else 12_000,
         )
     except Exception as exc:
         raise FormNotReadyError(f"Booking form controls not actionable: {exc}") from exc
+
+
+async def _element_visible(page: Page, selector: str) -> bool:
+    """True when the first match of *selector* is visible."""
+    try:
+        el = page.locator(selector)
+        if await el.count() == 0:
+            return False
+        return bool(await el.first.is_visible(timeout=1_000))
+    except Exception:
+        return False
+
+
+async def _open_sports_facility_panel(page: Page, config: AppConfig, *, rush: bool) -> bool:
+    """Click the Sports Facility toggle until the booking form is visible.
+
+    A single click right after a page load can silently no-op while the
+    page's JS is still initializing (2026-09-14: form rebuilds spent ~20s
+    waiting here and then failed), so retry the click while the activity
+    select stays hidden, with a JS-click fallback on any visible matching
+    element.
+    """
+    activity_sel = config.selectors.activity
+    sports_sel = config.selectors.sports_facility_button
+    if await _element_visible(page, activity_sel):
+        return True
+
+    async def _click_once() -> None:
+        try:
+            btn = page.locator(sports_sel)
+            if await btn.count() > 0:
+                await btn.first.click(timeout=4_000)
+                return
+        except Exception:
+            pass
+        try:
+            await page.evaluate(
+                """() => {
+                    const els = Array.from(document.querySelectorAll('a, button'))
+                        .filter(e => (e.textContent || '').trim().toLowerCase().includes('sports facility'));
+                    const vis = els.find(e => (e.offsetParent || e.getClientRects().length));
+                    if (vis) vis.click();
+                }"""
+            )
+        except Exception:
+            pass
+
+    attempts = 5 if rush else 3
+    for attempt in range(1, attempts + 1):
+        await _click_once()
+        try:
+            await page.wait_for_selector(
+                activity_sel, state="visible", timeout=3_000 if rush else 8_000,
+            )
+            if not rush:
+                await human_delay(1.0, 2.0)
+                await page.wait_for_load_state("networkidle")
+            return True
+        except Exception:
+            if attempt < attempts:
+                await asyncio.sleep(0.4)
+    if not rush:
+        try:
+            await page.wait_for_load_state("networkidle")
+        except Exception:
+            pass
+    return await _element_visible(page, activity_sel)
 
 
 async def _build_center_order(
@@ -2279,11 +2484,8 @@ async def _refire_search_or_rebuild(
         fired = False
     if not fired:
         try:
-            await tab.goto(BOOKING_URL, wait_until="domcontentloaded", timeout=8_000)
-            await _ensure_booking_form(tab, config, rush=True)
-            await select_booking_criteria(
-                tab, ref_date, config,
-                center_override=center_name, auto_search=False, rush=True,
+            await _rebuild_rush_form_tab(
+                tab, config, ref_date=ref_date, center_name=center_name,
             )
             await tab.evaluate(f"document.getElementById('{search_id}')?.click()")
         except Exception as exc:
@@ -3047,6 +3249,63 @@ async def _run_booking_rush(
     now_srv = datetime.now() + timedelta(milliseconds=server_delta_ms)
     remaining_pre_fire_s = (target_fire_srv - now_srv).total_seconds()
 
+    # ── Phase 2a: refresh the form (fresh CSRFToken) shortly before the fire ──
+    # The site freezes `CSRFToken: getCSRFToken()` into the Search click handler
+    # at page load; a form prepped at 08:00 holds a token the server stops
+    # accepting long before 08:30 (2026-09-14: every search 403'd for ~59s).
+    refresh_plan = _refresh_plan_s(
+        remaining_pre_fire_s,
+        before_s=float(getattr(config.settings, "rush_form_refresh_before_s", 0.0) or 0.0),
+    )
+    if refresh_plan is not None:
+        sleep_before_refresh, refresh_budget_s = refresh_plan
+        if sleep_before_refresh > 0:
+            logger.info("Sleeping {:.0f}s before form refresh …", sleep_before_refresh)
+            await _sleep_with_keepalive(center_tabs, sleep_before_refresh)
+        logger.info("Refreshing booking form tokens (budget {:.0f}s) …", refresh_budget_s)
+
+        async def _refresh_one(cname: str, tab: Page) -> bool:
+            per_try = max(5.0, refresh_budget_s / 2.0)
+            for attempt in (1, 2):
+                try:
+                    await asyncio.wait_for(
+                        _rebuild_rush_form_tab(
+                            tab, config, ref_date=ref_date, center_name=cname,
+                        ),
+                        timeout=per_try,
+                    )
+                    tracker.incr_metric("form_refresh_ok_count")
+                    return True
+                except Exception as exc:
+                    logger.warning(
+                        "Form refresh attempt {} failed for {}: {}", attempt, cname, exc,
+                    )
+            tracker.incr_metric("form_refresh_fail_count")
+            return False
+
+        t_refresh = time.monotonic()
+        with tracker.step("form_refresh"):
+            refreshed = await asyncio.gather(
+                *[_refresh_one(cn, t) for cn, t in center_tabs]
+            )
+        tracker.incr_metric("form_refresh_count")
+        tracker.set_metric(
+            "form_refresh_ms", round((time.monotonic() - t_refresh) * 1000.0, 1),
+        )
+        tracker.mark_event(
+            "form_refresh_done", ok=sum(1 for r in refreshed if r), tabs=len(center_tabs),
+        )
+        for (cn, tab), ok in zip(center_tabs, refreshed):
+            if not ok:
+                continue
+            try:
+                center_states[cn] = await _extract_booking_form_state(tab, config)
+            except Exception:
+                pass
+        now_srv = datetime.now() + timedelta(milliseconds=server_delta_ms)
+        remaining_pre_fire_s = (target_fire_srv - now_srv).total_seconds()
+        logger.info("Form refresh done ({:.1f}s left to fire)", remaining_pre_fire_s)
+
     if remaining_pre_fire_s > 3.0:
         sleep_before_warm, _ = _warmup_schedule_s(remaining_pre_fire_s)
         logger.info("Sleeping {:.0f}s before warm-up …", sleep_before_warm)
@@ -3120,6 +3379,7 @@ async def _run_booking_rush(
     booking_claimed = False
     inventory_seen = asyncio.Event()
     stop_boundary_probes = asyncio.Event()
+    search_403_event = asyncio.Event()
     network_attempt = {"n": 0}
     boundary_hit_offset_ms: int | None = None
 
@@ -3137,6 +3397,10 @@ async def _run_booking_rush(
                     center=center_name,
                     status=response.status,
                 )
+                if req_type == "search" and response.status == 403:
+                    tracker.incr_metric("search_403_count")
+                    tracker.mark_event("search_403_seen", center=center_name)
+                    search_403_event.set()
                 network_attempt["n"] += 1
                 finished = tracker.ms_since_rush()
                 started = finished
@@ -3274,6 +3538,45 @@ async def _run_booking_rush(
 
     probe_task = asyncio.create_task(_boundary_probe_scheduler())
     api_wave_hook = None  # set after claim helpers are ready
+
+    async def _token_heal_task() -> None:
+        """Rebuild + refire when a search 403s on a stale CSRFToken.
+
+        The site freezes the CSRFToken into the Search click handler at page
+        load, so a 403 means the page must be re-rendered before any further
+        search can succeed.  Rebuild immediately instead of waiting ~60s for
+        the retry waves to get around to it.
+        """
+        rounds = 0
+        while not stop_boundary_probes.is_set():
+            if rounds >= _RUSH_TOKEN_HEAL_MAX_ROUNDS:
+                return
+            try:
+                await asyncio.wait_for(search_403_event.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                return
+            search_403_event.clear()
+            if stop_boundary_probes.is_set() or booking_claimed:
+                return
+            rounds += 1
+            tracker.incr_metric("search_403_heal_count")
+            logger.warning(
+                "Search 403 (stale CSRFToken) - rebuilding tabs to refresh (heal {}/{})",
+                rounds, _RUSH_TOKEN_HEAL_MAX_ROUNDS,
+            )
+            ok, failed = await _token_heal_round(
+                center_tabs, config, ref_date=ref_date,
+                is_stopped=lambda: stop_boundary_probes.is_set() or booking_claimed,
+            )
+            if ok:
+                tracker.incr_metric("search_403_heal_refire_count")
+            if failed:
+                tracker.incr_metric("search_403_heal_fail_count")
+            await asyncio.sleep(_RUSH_TOKEN_HEAL_COOLDOWN_S)
+
+    heal_task = asyncio.create_task(_token_heal_task())
 
     def _first_acceptable_from_scan(
         all_date_slots: dict[date, List[TimeSlot]],
@@ -3482,7 +3785,13 @@ async def _run_booking_rush(
 
         async def _search_one(center_name: str) -> tuple[str, dict[date, List[TimeSlot]], float] | None:
             state = center_states.get(center_name) or {}
-            csrf = state.get("csrf_token", "")
+            tab = tab_by_center.get(center_name)
+            # Read the token fresh from the (pre-fire refreshed) form: the
+            # prep-time token used to be frozen into state and would 403 once
+            # it aged out (2026-09-14: all 8 API searches died that way).
+            csrf = await _read_tab_csrf_token(tab) if tab is not None else ""
+            if not csrf:
+                csrf = state.get("csrf_token", "")
             if not csrf:
                 return None
             # Search the earliest target date first (same as UI prep date).
@@ -3491,7 +3800,9 @@ async def _run_booking_rush(
             t0 = time.monotonic()
             started_ms = tracker.ms_since_rush()
             tracker.incr_metric("api_search_attempt_count")
-            result = await api_client.search(csrf_token=csrf, payload=payload)
+            result = await _api_search_with_fresh_token(
+                api_client, tab, csrf_token=csrf, payload=payload,
+            )
             rtt_ms = round((time.monotonic() - t0) * 1000.0, 1)
             finished_ms = tracker.ms_since_rush()
             tracker.record_network(
@@ -3852,6 +4163,14 @@ async def _run_booking_rush(
         probe_task.cancel()
         try:
             await probe_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+    if not heal_task.done():
+        heal_task.cancel()
+        try:
+            await heal_task
         except asyncio.CancelledError:
             pass
         except Exception:
