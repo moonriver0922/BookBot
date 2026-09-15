@@ -63,6 +63,61 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 
 ## Recent Stage History
 
+## 2026-09-15 — Rush crash containment (lane isolation + nav-race tolerant evaluates)
+
+### Completed
+
+- Morning run `20260915-080010-7aa1` FAILED — `COMPETITION_LOSS`
+  (booking_conflict).  All 09-14 fixes validated live: zero 403s
+  (`form_refresh_ok_count=2`), API race alive (`api_search_ok_count=8`,
+  first candidate sourced from it), fire on time (-196ms), warmup 2/2,
+  keepalive 6 pings, endgame clicks 13ms / armed wait 169ms.
+  - Server was the worst yet: first search response +17.6s, Shaw-main API
+    searches hung 48s with no payload (4/4), repeated "Could not parse
+    timetable structure" pages.
+  - The 09-22 09:30-10:30 slot: seen at +18.8s → submitted 540ms later →
+    conflict.  3 submit attempts total, all conflicts; by +118s no
+    acceptable slot was visible any more — the inventory went in ~2min.
+  - Crash: at +72s a page navigation destroyed the JS context under the
+    confirm-page checkbox evaluate and the exception aborted the ENTIRE
+    attempt; the 5s-later retry re-fired ~105s late with one center skipped
+    (deadline) and found nothing.  The lost 54s tail is exactly where the
+    09-14 comeback wave won.
+- Fixes (branch `feature/rush-crash-resilience`):
+  - `_safe_evaluate` — retries evaluates that lose their context to a
+    navigation (page settles between attempts); non-navigation errors still
+    raise so real bugs stay visible.
+  - `_tick_confirm_checkboxes` — checkbox tick with an honest locator-click
+    fallback; never raises.
+  - `_book_slots_guarded` — every rush lane call site wrapped: a lane fails
+    locally (`lane_exception` feedback, candidate closed as
+    `automation_failure`) while the wave loop keeps going; maintenance /
+    form-not-ready errors still propagate to the attempt handler.
+  - Confirmation-page grace window before the bare load-state fallback;
+    `confirmation_page_seen` can now be marked inside the grace window.
+  - First-occurrence metrics sticky (`actual_fire_delay_ms`,
+    `primary_boundary_offset_ms`, `refresh_to_first_candidate_ms`,
+    `first_candidate_source`) — retry attempts no longer overwrite the first
+    fire's numbers (the 09-15 report showed `actual_fire_delay_ms=104875.6`
+    from attempt 2 while attempt 1 fired on time).
+
+### Validation
+
+- `pytest`: 89/89 (new `tests/test_rush_crash_resilience.py`, 17 cases,
+  including an end-to-end regression of the exact crash path).
+- Live probe against the real site (off-peak): deterministic reproduction of
+  the crash class — raw `page.evaluate` RAISED "Execution context was
+  destroyed, most likely because of a navigation" while `_safe_evaluate` on
+  the same destruction returned 'SURVIVED'; checkbox tick on a live page
+  returned 1/0 without raising (twice, incl. during a nav race);
+  confirm-page wait returned its fallback verdict without hanging.
+
+### Git
+
+- Branch: `feature/rush-crash-resilience`
+- Commit: `6b82d4f`
+- Push status: pushed
+
 ## 2026-09-14 (evening) — CSRF token freshness (403 blackout fix)
 
 ### Completed
