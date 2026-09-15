@@ -2,6 +2,39 @@
 
 All notable review and optimization changes are recorded here.
 
+## 2026-09-15
+
+- Crash resilience (mid-rush attempt killer): during the 08:30 rush a page
+  navigation destroyed the JS context under the confirm-page checkbox
+  evaluate; the exception bubbled from `book_slots` through the wave loop
+  and aborted the whole attempt at +72s, so the late recovery waves (the
+  09-14 safety net) never ran.  The 5s-later retry attempt had to re-fire
+  ~105s late with one center skipped due to the deadline.  Fixes:
+  - `_safe_evaluate`: retries when the JS context is lost to a navigation
+    (waits for the page to settle between attempts) instead of raising;
+    non-navigation errors still raise.
+  - `_tick_confirm_checkboxes`: the rush checkbox tick falls back to
+    Playwright locator clicks (which re-resolve after navigations) when the
+    JS context is lost, and never raises.
+  - `_book_slots_guarded`: every rush booking-lane call site is now wrapped
+    — a lane fails locally (`lane_exception` feedback + candidate closed as
+    `automation_failure`) while the wave loop keeps going; session-level
+    errors (maintenance / form-not-ready) still propagate to the attempt
+    handler.
+  - Confirm-page grace window: when the first (tight) budget misses, keep
+    waiting for the real confirm controls for one grace window
+    (`rush_confirm_result_timeout_ms`) before the bare load-state fallback;
+    `confirmation_page_seen` can now be marked inside the grace window.
+  - First-occurrence metrics (`actual_fire_delay_ms`,
+    `primary_boundary_offset_ms`, `refresh_to_first_candidate_ms`,
+    `first_candidate_source`) are no longer overwritten by retry attempts —
+    the 09-15 report showed `actual_fire_delay_ms=104875.6` (attempt 2)
+    while the first fire was actually on time (-196ms).
+- Tests: `tests/test_rush_crash_resilience.py` — safe-evaluate retries,
+  checkbox fallback, lane isolation, confirm-page grace, sticky metrics,
+  and an end-to-end regression of the exact 09-15 crash path (tick loses
+  its context → flow still completes the booking).
+
 ## 2026-09-14
 
 - CSRF token freshness (root cause of the run's ~59s search blackout): the

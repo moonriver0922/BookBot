@@ -1821,6 +1821,154 @@ async def _click_next_fast(page: Page, next_selector: str, backoff_ms: list[int]
     return False
 
 
+# ---------------------------------------------------------------------------
+# Rush crash resilience (2026-09-15)
+# ---------------------------------------------------------------------------
+# A page navigation destroyed the JS context under the confirm-page checkbox
+# evaluate mid-rush; the exception bubbled up through the wave loop and killed
+# the entire attempt — taking the late recovery waves (the 09-14 safety net)
+# with it.  On the hot path a lane must fail locally, evaluates must tolerate
+# losing their context, and the confirm-page wait gets a grace window under
+# slow server renders.
+
+_CTX_LOST_MARKERS = (
+    "execution context was destroyed",
+    "target page, context or browser has been closed",
+    "target closed",
+    "frame was detached",
+    "navigation interrupted",
+)
+
+
+def _is_context_lost(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _CTX_LOST_MARKERS)
+
+
+def _set_metric_once(name: str, value: object) -> None:
+    """Record a first-occurrence metric; retry attempts must not overwrite it."""
+    try:
+        existing = getattr(tracker, "_metrics", None) or {}
+    except Exception:
+        existing = {}
+    if name in existing:
+        return
+    tracker.set_metric(name, value)
+
+
+async def _safe_evaluate(
+    page: Page,
+    script: str,
+    arg: object = None,
+    *,
+    retries: int = 3,
+    wait_timeout_ms: int = 1500,
+    default: object = None,
+) -> object:
+    """``page.evaluate`` that tolerates losing the JS context to a navigation.
+
+    Non-navigation errors still raise so real bugs stay visible; when every
+    retry loses the race the caller's ``default`` is returned instead.
+    """
+    last_exc: BaseException | None = None
+    for attempt in range(1, max(1, int(retries)) + 1):
+        try:
+            if arg is None:
+                return await page.evaluate(script)
+            return await page.evaluate(script, arg)
+        except Exception as exc:  # noqa: BLE001 — classified below
+            if not _is_context_lost(exc):
+                raise
+            last_exc = exc
+            try:
+                await page.wait_for_load_state(
+                    "domcontentloaded", timeout=max(100, wait_timeout_ms),
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(0.05 * attempt)
+    logger.warning("safe evaluate gave up after {} retries: {}", retries, last_exc)
+    return default
+
+
+async def _tick_confirm_checkboxes(page: Page) -> int:
+    """Tick confirm-page checkboxes; survives a mid-navigation context loss.
+
+    Primary path is one JS evaluation (fastest).  If the page navigated under
+    it, fall back to Playwright locator clicks, which re-resolve after
+    navigations.  Returns how many checkboxes were (attempted to be) ticked.
+    """
+    ticked = await _safe_evaluate(
+        page,
+        """() => {
+            const cbs = document.querySelectorAll('input[type="checkbox"]:not(:checked)');
+            cbs.forEach(cb => cb.click());
+            return cbs.length;
+        }""",
+    )
+    if ticked is not None:
+        return int(ticked) if isinstance(ticked, (int, float)) else 0
+
+    try:
+        cbs = page.locator('input[type="checkbox"]:not(:checked)')
+        count = await cbs.count()
+        for i in range(count):
+            try:
+                await cbs.nth(i).check(timeout=1000)
+            except Exception:
+                pass
+        logger.info("Ticked {} checkbox(es) via locator fallback", count)
+        return count
+    except Exception as exc:
+        logger.debug("Checkbox tick fallback failed: {}", exc)
+        return 0
+
+
+_CONFIRM_PAGE_SELECTOR = (
+    'input[type="checkbox"], button:has-text("Confirm"), '
+    'input[value="Confirm"], button:has-text("Submit")'
+)
+
+
+async def _await_confirmation_page(
+    page: Page,
+    *,
+    page_timeout_ms: int,
+    grace_timeout_ms: int,
+) -> bool:
+    """Wait for the confirmation-page controls, with a grace window under load.
+
+    First budget stays tight for speed; when the render is slow we keep
+    waiting for the *real* controls for one more grace window before falling
+    back to a bare load-state wait.
+    """
+    try:
+        await page.wait_for_selector(
+            _CONFIRM_PAGE_SELECTOR, timeout=max(100, int(page_timeout_ms)),
+        )
+        tracker.mark_event("confirmation_page_seen")
+        return True
+    except Exception:
+        tracker.add_feedback("confirmation_page_too_slow", timeout_ms=page_timeout_ms)
+
+    try:
+        await page.wait_for_selector(
+            _CONFIRM_PAGE_SELECTOR, timeout=max(100, int(grace_timeout_ms)),
+        )
+        tracker.mark_event("confirmation_page_seen", grace=True)
+        return True
+    except Exception:
+        pass
+
+    try:
+        await page.wait_for_load_state(
+            "domcontentloaded", timeout=max(100, int(grace_timeout_ms)),
+        )
+        return True
+    except Exception:
+        return False
+
+
 async def book_slots(page: Page, slots_to_book: List[TimeSlot], target: date, config: AppConfig,
                      *, rush: bool = False, candidate: dict | None = None) -> bool:
     """Click on the chosen slot(s) in the timetable grid and confirm the booking.
@@ -1942,25 +2090,14 @@ async def book_slots(page: Page, slots_to_book: List[TimeSlot], target: date, co
                 tracker.finish_candidate(candidate, "automation_failure")
             return False
         tracker.mark_event("confirmation_page_wait_started")
-        try:
-            await page.wait_for_selector(
-                'input[type="checkbox"], button:has-text("Confirm"), '
-                'input[value="Confirm"], button:has-text("Submit")',
-                timeout=max(100, confirm_page_timeout),
-            )
-            tracker.mark_event("confirmation_page_seen")
-        except Exception:
-            tracker.add_feedback("confirmation_page_too_slow",
-                                 timeout_ms=confirm_page_timeout)
-            try:
-                await page.wait_for_load_state(
-                    "domcontentloaded",
-                    timeout=max(100, confirm_result_timeout),
-                )
-            except Exception:
-                if candidate is not None:
-                    tracker.finish_candidate(candidate, "bot_latency_loss")
-                return False
+        if not await _await_confirmation_page(
+            page,
+            page_timeout_ms=confirm_page_timeout,
+            grace_timeout_ms=confirm_result_timeout,
+        ):
+            if candidate is not None:
+                tracker.finish_candidate(candidate, "bot_latency_loss")
+            return False
     else:
         next_btn = page.locator(f"{next_selector}:not([disabled])")
         if await next_btn.count() == 0:
@@ -1974,15 +2111,9 @@ async def book_slots(page: Page, slots_to_book: List[TimeSlot], target: date, co
 
     # ── Step 3: Tick checkboxes ──
     if rush:
-        ticked = await page.evaluate(
-            """() => {
-                const cbs = document.querySelectorAll('input[type="checkbox"]:not(:checked)');
-                cbs.forEach(cb => cb.click());
-                return cbs.length;
-            }"""
-        )
+        ticked = await _tick_confirm_checkboxes(page)
         if ticked:
-            logger.info("Ticked {} checkbox(es) via JS", ticked)
+            logger.info("Ticked {} checkbox(es)", ticked)
     else:
         checkboxes = page.locator(
             'input[type="checkbox"]:not(:checked), '
@@ -2076,6 +2207,49 @@ async def book_slots(page: Page, slots_to_book: List[TimeSlot], target: date, co
         await save_debug_snapshot(page, "11_no_confirm_button")
 
     return True
+
+
+async def _book_slots_guarded(
+    tab: Page,
+    best: List[TimeSlot],
+    target: date,
+    config: AppConfig,
+    *,
+    candidate: dict | None = None,
+    center_name: str = "",
+) -> bool:
+    """``book_slots`` with lane-local failure isolation on the rush hot path.
+
+    Any unexpected page error inside a booking lane (e.g. a mid-navigation
+    context destruction) must fail just that lane — the wave loop continues
+    with the remaining centers and the late recovery waves stay alive.
+    Session-level errors still propagate to the attempt handler.
+    """
+    try:
+        return await book_slots(
+            tab, best, target, config, rush=True, candidate=candidate,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        from bookbot.auth import MaintenanceError
+
+        if isinstance(exc, (MaintenanceError, FormNotReadyError)):
+            raise
+        logger.warning(
+            "book_slots lane failed for {} @ {} ({}): {}",
+            center_name or "?", target, type(exc).__name__, exc,
+        )
+        tracker.add_feedback(
+            "lane_exception",
+            center=center_name,
+            date=str(target),
+            error=type(exc).__name__,
+            detail=str(exc)[:200],
+        )
+        if candidate is not None:
+            tracker.finish_candidate(candidate, "automation_failure")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -2557,7 +2731,9 @@ async def _retry_same_slot_lane(
             continue
 
         tracker.incr_metric("submit_attempt_count")
-        success = await book_slots(tab, choice, target, config, rush=True)
+        success = await _book_slots_guarded(
+            tab, choice, target, config, center_name=center_name,
+        )
         if success:
             return choice
 
@@ -3354,14 +3530,14 @@ async def _run_booking_rush(
     tracker.mark_rush_start_aligned(open_in_seconds=open_in_s)
     rush_started_at = time.monotonic() + open_in_s
     adjusted_now = datetime.now() + timedelta(milliseconds=server_delta_ms)
-    tracker.set_metric(
+    _set_metric_once(
         "actual_fire_delay_ms",
         round((adjusted_now - (adjusted_now.replace(
             hour=rush_time[0], minute=rush_time[1], second=rush_time[2], microsecond=0,
         ) + timedelta(milliseconds=first_offset_ms))).total_seconds() * 1000, 1),
     )
     tracker.set_metric("configured_fire_offset_ms", pre_fire_ms)
-    tracker.set_metric("primary_boundary_offset_ms", first_offset_ms)
+    _set_metric_once("primary_boundary_offset_ms", first_offset_ms)
     tracker.set_metric("estimated_server_delta_ms", server_delta_ms)
     first_candidate_seen_at: float | None = None
     first_submit_started_at: float | None = None
@@ -3864,11 +4040,11 @@ async def _run_booking_rush(
             _note_inventory(offset_ms)
             if first_candidate_seen_at is None:
                 first_candidate_seen_at = time.monotonic()
-                tracker.set_metric(
+                _set_metric_once(
                     "refresh_to_first_candidate_ms",
                     round((first_candidate_seen_at - rush_started_at) * 1000, 1),
                 )
-                tracker.set_metric("first_candidate_source", "api_search")
+                _set_metric_once("first_candidate_source", "api_search")
 
             if not await _try_claim_booking():
                 return
@@ -3971,8 +4147,9 @@ async def _run_booking_rush(
                     if not await _try_claim_booking():
                         return
                 with tracker.step(f"book_slots_api_hit|{center_name}|{target}"):
-                    booked_ok = await book_slots(
-                        tab, best, target, config, rush=True, candidate=candidate,
+                    booked_ok = await _book_slots_guarded(
+                        tab, best, target, config,
+                        candidate=candidate, center_name=center_name,
                     )
                 if not booked_ok:
                     tracker.add_feedback(
@@ -4061,7 +4238,7 @@ async def _run_booking_rush(
 
             if first_candidate_seen_at is None:
                 first_candidate_seen_at = time.monotonic()
-                tracker.set_metric(
+                _set_metric_once(
                     "refresh_to_first_candidate_ms",
                     round((first_candidate_seen_at - rush_started_at) * 1000, 1),
                 )
@@ -4104,8 +4281,9 @@ async def _run_booking_rush(
 
             tracker.incr_metric("submit_attempt_count")
             with tracker.step(f"book_slots|{center_name}|{target}"):
-                success = await book_slots(
-                    tab, best, target, config, rush=True, candidate=candidate,
+                success = await _book_slots_guarded(
+                    tab, best, target, config,
+                    candidate=candidate, center_name=center_name,
                 )
             if success:
                 remaining -= len(best)
@@ -4259,8 +4437,9 @@ async def _run_booking_rush(
 
                     with tracker.step(f"wave{wave}_book|{cn}|{target}"):
                         tracker.incr_metric("submit_attempt_count")
-                        success = await book_slots(
-                            tab, best, target, config, rush=True, candidate=candidate,
+                        success = await _book_slots_guarded(
+                            tab, best, target, config,
+                            candidate=candidate, center_name=cn,
                         )
                     if success:
                         remaining -= len(best)
