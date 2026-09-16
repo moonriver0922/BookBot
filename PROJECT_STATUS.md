@@ -63,6 +63,41 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 
 ## Recent Stage History
 
+## 2026-09-16 — Live win #2 + booking evidence archive
+
+### Completed
+
+- Morning run `20260916-080012-0111` SUCCESS on the crash-resilience build
+  (`dac01da`): booked 2026-09-23 (Wed) 09:30-10:30 @ Shaw Sports Complex -
+  Sports Practice Hall (BMT07), wave 2, single $10 deduction.  Verified on
+  the site's My Record ledger (16 Sep 08:31 AM, "Individual Booking
+  (Confirmed)"; balance $43).
+- The 09-15 crash-resilience work was exercised live: two
+  `confirmation_page_too_slow` events — one lane bailed cleanly
+  (`bot_latency_loss`), the winning lane ticked its checkbox (new helper)
+  and confirmed at +81s.  Server again slow (first timetable +18.9s;
+  Shaw-main API searches hung ~48s, 4/4).
+- Booking evidence archive: the success path saves a confirmation screenshot
+  + body text under `logs/booking_evidence/` and records a `booking_evidence`
+  metric, so wins have a local receipt independent of the (occasionally
+  missing) confirmation email.
+- Hermes-side companion: a daily (08:40) Discord morning report posts the
+  result to the bookbot thread, attaching the evidence screenshot on wins.
+
+### Validation
+
+- `pytest`: 91/91 (`TestBookingEvidence` for the archive helper incl. the
+  screenshot-failure path; the crash regression now asserts the receipt is
+  archived on success).
+- Live: booking verified against the site's My Record ledger;
+  `tests/smoke_verify_booking.py` committed for future checks.
+
+### Git
+
+- Branch: `feature/rush-crash-resilience`
+- Commit: `9f70a82`
+- Push status: pushed
+
 ## 2026-09-15 — Rush crash containment (lane isolation + nav-race tolerant evaluates)
 
 ### Completed
