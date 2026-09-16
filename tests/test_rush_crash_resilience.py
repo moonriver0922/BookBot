@@ -288,6 +288,47 @@ class TestStickyMetrics:
 
 
 # ---------------------------------------------------------------------------
+# Booking evidence archival
+# ---------------------------------------------------------------------------
+
+class EvidencePage:
+    """Fake page for _save_booking_evidence: writes a real PNG stub file."""
+
+    def __init__(self, *, screenshot_raises=False):
+        self.screenshot_raises = screenshot_raises
+        self.screenshots: list[str] = []
+
+    async def screenshot(self, path=None, timeout=None, **kwargs):
+        if self.screenshot_raises:
+            raise RuntimeError("screenshot unavailable")
+        self.screenshots.append(path)
+        if path:
+            with open(path, "wb") as fh:
+                fh.write(b"\x89PNG\r\n")
+
+    async def inner_text(self, selector):
+        return "Booking confirmed\nShaw Sports Complex\n09:30 - 10:30"
+
+
+class TestBookingEvidence:
+    def test_evidence_files_and_metric_written(self, fake_tracker, tmp_path):
+        page = EvidencePage()
+        out = asyncio.run(booker._save_booking_evidence(page, base_dir=tmp_path))
+        assert out is not None and out.exists()
+        assert out.parent == tmp_path
+        texts = list(tmp_path.glob("*-confirm.txt"))
+        assert len(texts) == 1
+        assert "Booking confirmed" in texts[0].read_text(encoding="utf-8")
+        assert "booking_evidence" in fake_tracker._metrics
+
+    def test_evidence_survives_screenshot_failure(self, fake_tracker, tmp_path):
+        page = EvidencePage(screenshot_raises=True)
+        out = asyncio.run(booker._save_booking_evidence(page, base_dir=tmp_path))
+        assert out is None
+        assert len(list(tmp_path.glob("*-confirm.txt"))) == 1
+
+
+# ---------------------------------------------------------------------------
 # End-to-end: the exact 09-15 crash path must not kill book_slots any more
 # ---------------------------------------------------------------------------
 
@@ -378,6 +419,13 @@ class TestCrashPathRegression:
 
         monkeypatch.setattr(booker, "_click_next_fast", fake_next_click)
 
+        evidence_calls: list = []
+
+        async def fake_evidence(*args, **kwargs):
+            evidence_calls.append(1)
+
+        monkeypatch.setattr(booker, "_save_booking_evidence", fake_evidence)
+
         page = BookSlotsStubPage()
         slots = [
             SimpleNamespace(start="09:30", end="10:30"),
@@ -397,3 +445,4 @@ class TestCrashPathRegression:
         assert page.locator_checks == 2  # both checkboxes ticked via locators
         assert page.confirm_clicks == 1  # booking still confirmed
         assert candidate["result"] == "booked"
+        assert evidence_calls == [1]  # receipt archived on success

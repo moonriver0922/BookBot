@@ -2,6 +2,21 @@
 
 All notable review and optimization changes are recorded here.
 
+## 2026-09-16
+
+- Morning rush WON on the crash-resilience build (`dac01da`): 9/23 Wed
+  09:30-10:30 @ Shaw Sports Practice Hall, wave 2.  The mid-run flow hit
+  `confirmation_page_too_slow` twice - both lanes degraded cleanly (one
+  bailed as `bot_latency_loss`, the winner ticked its checkbox via the new
+  helper and confirmed) instead of killing the attempt.  Server was slow
+  again (first timetable +18.9s; Shaw-main API searches hung 4/4 for ~48s).
+- Booking evidence: on success the confirmation page is archived as a
+  screenshot + body text under `logs/booking_evidence/` (`booking_evidence`
+  metric).  Motivation: the site's confirmation email can be delayed or
+  missing, and a missing email made a real win look like a failure.
+- Tests: `TestBookingEvidence` plus the crash-path regression now asserts
+  the receipt is archived on a successful booking.
+
 ## 2026-09-15
 
 - Crash resilience (mid-rush attempt killer): during the 08:30 rush a page

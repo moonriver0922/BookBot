@@ -1969,6 +1969,35 @@ async def _await_confirmation_page(
         return False
 
 
+_EVIDENCE_DIR = Path("logs/booking_evidence")
+
+
+async def _save_booking_evidence(page: Page, base_dir: Path | None = None) -> Path | None:
+    """Archive a screenshot + visible text of the confirmation page.
+
+    2026-09-16: the site's confirmation email can be delayed or missing, and a
+    missing email made a successful booking look like a failure.  This local
+    receipt (plus the daily morning report) answers "did it actually book?"
+    without logging into POSS.  Must never break the booking flow itself.
+    """
+    out_dir = Path(base_dir) if base_dir is not None else _EVIDENCE_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    shot_path: Path | None = out_dir / f"{stamp}-confirm.png"
+    try:
+        await page.screenshot(path=str(shot_path), timeout=8_000)
+    except Exception as exc:
+        logger.debug("Evidence screenshot failed: {}", exc)
+        shot_path = None
+    try:
+        text = await page.inner_text("body")
+        (out_dir / f"{stamp}-confirm.txt").write_text(text, encoding="utf-8")
+    except Exception as exc:
+        logger.debug("Evidence text dump failed: {}", exc)
+    tracker.set_metric("booking_evidence", str(shot_path or out_dir))
+    return shot_path
+
+
 async def book_slots(page: Page, slots_to_book: List[TimeSlot], target: date, config: AppConfig,
                      *, rush: bool = False, candidate: dict | None = None) -> bool:
     """Click on the chosen slot(s) in the timetable grid and confirm the booking.
@@ -2197,6 +2226,12 @@ async def book_slots(page: Page, slots_to_book: List[TimeSlot], target: date, co
                     await save_debug_snapshot(page, "12_final_confirm")
         except Exception as exc:
             logger.debug("OK/Yes button click skipped or timed out: {}", exc)
+
+        # Keep a local receipt of the confirmation page (screenshot + text).
+        try:
+            await _save_booking_evidence(page)
+        except Exception as exc:
+            logger.debug("Booking evidence capture failed: {}", exc)
     else:
         logger.warning("No confirm button found – booking may require manual confirmation")
         if rush:
