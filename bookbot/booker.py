@@ -1100,7 +1100,12 @@ async def scan_available_slots(
     cname = center_name or config.preferences.center
     slots = _slots_from_column(grid, times, target_col, target, cname, verbose=not rush)
 
-    logger.info("Found {} available slots on {}", len(slots), target)
+    logger.info(
+        "Found {} available slots on {} [{}]",
+        len(slots),
+        target,
+        ", ".join(f"{s.start}-{s.end}" for s in slots[:12]) or "-",
+    )
     for s in slots:
         logger.debug("  {} – {}", s.start, s.end)
     return slots
@@ -1150,7 +1155,13 @@ async def scan_available_slots_multi(
 
         slots = _slots_from_column(grid, times, target_col, target, center_name, verbose=False)
         result[target] = slots
-        logger.info("  {} (col {}): {} available slots", target, target_col, len(slots))
+        logger.info(
+            "  {} (col {}): {} available slots [{}]",
+            target,
+            target_col,
+            len(slots),
+            ", ".join(f"{s.start}-{s.end}" for s in slots[:12]) or "-",
+        )
 
     return result
 
@@ -1394,6 +1405,100 @@ def find_rush_booking(
     best = candidates[0]
     logger.info("Rush first-acceptable slot: {} – {}", best.start, best.end)
     return [best]
+
+
+# ---------------------------------------------------------------------------
+# Failed-slot memory (same-run preference steering, 2026-09-17)
+# ---------------------------------------------------------------------------
+
+def _failed_slot_key(
+    center: str, target: date, slot: TimeSlot,
+) -> tuple[str, str, str, str]:
+    """Identity of a bookable cell for the same-run failed-slot memory."""
+    return (str(center or ""), str(target), str(slot.start), str(slot.end))
+
+
+def _note_failed_slots(
+    memory: dict[tuple[str, str, str, str], float],
+    *,
+    center: str,
+    target: date,
+    slots: List[TimeSlot],
+    reason: str,
+) -> None:
+    """Remember cell(s) that just failed to book so later picks prefer others.
+
+    2026-09-17: all four rush attempts hammered the same 09:30-10:30 cell
+    because every re-scan still showed it as available.  Failed cells are now
+    remembered for the rest of the run (``_prefer_unfailed_slots`` steers the
+    next attempt to a different cell while one remains; when nothing else is
+    left it falls back to the tried cells - a repeated attempt beats none:
+    2026-09-16's win came from retrying the same evening slot).
+    """
+    if not slots:
+        return
+    now = time.monotonic()
+    for s in slots:
+        memory[_failed_slot_key(center, target, s)] = now
+    tracker.incr_metric("failed_slot_marked_count")
+    logger.info(
+        "Failed-slot memory: marked {} cell(s) after {} ({} @ {})",
+        len(slots), reason, center, target,
+    )
+
+
+def _prefer_unfailed_slots(
+    slots: List[TimeSlot],
+    memory: dict[tuple[str, str, str, str], float],
+    *,
+    center: str,
+    target: date,
+    config: AppConfig,
+    relaxed: bool = False,
+) -> List[TimeSlot]:
+    """Drop already-failed cells when an untried acceptable one still remains.
+
+    Falls back to the full list when every acceptable cell has failed (or the
+    only untried cells are unacceptable) - retrying beats skipping.
+    """
+    if not slots or not memory:
+        return slots
+
+    def _key(s: TimeSlot) -> tuple[str, str, str, str]:
+        return _failed_slot_key(center, target, s)
+
+    if not any(_key(s) in memory for s in slots):
+        return slots
+    has_alternative = any(
+        is_acceptable_rush_slot(s, config, relaxed=relaxed, target=target)
+        for s in slots
+        if _key(s) not in memory
+    )
+    if not has_alternative:
+        return slots
+    kept = [s for s in slots if _key(s) not in memory]
+    tracker.incr_metric("failed_slot_skip_count")
+    logger.info(
+        "Failed-slot memory: skipping {} tried cell(s) on {} @ {}",
+        len(slots) - len(kept), center, target,
+    )
+    return kept
+
+
+def _choose_rush_slots(
+    slots: List[TimeSlot],
+    remaining_quota: int,
+    config: AppConfig,
+    *,
+    center: str,
+    target: date,
+    memory: dict[tuple[str, str, str, str], float],
+) -> List[TimeSlot]:
+    """Rush slot choice that steers around cells already failed this run."""
+    usable = _prefer_unfailed_slots(
+        slots, memory, center=center, target=target, config=config,
+    )
+    return find_best_booking(usable, remaining_quota, config, rush=True, target=target)
 
 
 # ---------------------------------------------------------------------------
@@ -1998,6 +2103,68 @@ async def _save_booking_evidence(page: Page, base_dir: Path | None = None) -> Pa
     return shot_path
 
 
+async def _capture_failure_evidence(
+    page: Page,
+    tag: str,
+    *,
+    screenshot: bool = False,
+    base_dir: Path | None = None,
+) -> Path | None:
+    """Dump what the server actually showed on a failed attempt (best effort).
+
+    2026-09-17: three rush attempts ended with "confirmation page never
+    appeared" and there was no record of the server's response - attribution
+    had to be guessed from network events.  These dumps (visible text + URL,
+    optional screenshot) make the next such failure self-explaining.  Must
+    never raise or stall the flow: every probe is time-capped.
+    """
+    out_dir = Path(base_dir) if base_dir is not None else _EVIDENCE_DIR
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        logger.debug("Failure evidence dir failed: {}", exc)
+        return None
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    txt_path = out_dir / f"{stamp}-{tag}.txt"
+    try:
+        url = str(getattr(page, "url", "") or "")
+        try:
+            title = await asyncio.wait_for(page.title(), timeout=1.5)
+        except Exception:
+            title = ""
+        try:
+            body = await asyncio.wait_for(
+                page.inner_text("body", timeout=2_000), timeout=3.0,
+            )
+        except Exception as exc:
+            body = f"<inner_text failed: {type(exc).__name__}: {exc}>"
+        txt_path.write_text(
+            f"url: {url}\ntitle: {title}\n---\n{(body or '')[:200_000]}",
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        logger.debug("Failure evidence text dump failed: {}", exc)
+        return None
+
+    shot_path: Path | None = None
+    if screenshot:
+        try:
+            candidate = out_dir / f"{stamp}-{tag}.png"
+            await asyncio.wait_for(
+                page.screenshot(path=str(candidate), timeout=4_000), timeout=6.0,
+            )
+            shot_path = candidate
+        except Exception as exc:
+            logger.debug("Failure evidence screenshot failed: {}", exc)
+
+    try:
+        tracker.incr_metric("failure_evidence_count")
+        tracker.set_metric("failure_evidence_last", str(shot_path or txt_path))
+    except Exception:
+        pass
+    return shot_path or txt_path
+
+
 async def book_slots(page: Page, slots_to_book: List[TimeSlot], target: date, config: AppConfig,
                      *, rush: bool = False, candidate: dict | None = None) -> bool:
     """Click on the chosen slot(s) in the timetable grid and confirm the booking.
@@ -2124,6 +2291,14 @@ async def book_slots(page: Page, slots_to_book: List[TimeSlot], target: date, co
             page_timeout_ms=confirm_page_timeout,
             grace_timeout_ms=confirm_result_timeout,
         ):
+            # The confirm page never showed - keep what the server *did* render
+            # so the next such loss is self-explaining (2026-09-17).
+            try:
+                await _capture_failure_evidence(
+                    page, "fail-confirm-missing", screenshot=not rush,
+                )
+            except Exception as exc:
+                logger.debug("Failure evidence capture failed: {}", exc)
             if candidate is not None:
                 tracker.finish_candidate(candidate, "bot_latency_loss")
             return False
@@ -2194,6 +2369,10 @@ async def book_slots(page: Page, slots_to_book: List[TimeSlot], target: date, co
 
         if await _is_booking_conflict(page):
             logger.warning("Slot was already taken (occupied)! Will try another slot.")
+            try:
+                await _capture_failure_evidence(page, "fail-conflict", screenshot=not rush)
+            except Exception as exc:
+                logger.debug("Failure evidence capture failed: {}", exc)
             if candidate is not None:
                 tracker.finish_candidate(candidate, "conflict")
             back_btn = page.locator('a:has-text("Back"), button:has-text("Back")')
@@ -2235,6 +2414,12 @@ async def book_slots(page: Page, slots_to_book: List[TimeSlot], target: date, co
     else:
         logger.warning("No confirm button found – booking may require manual confirmation")
         if rush:
+            try:
+                await _capture_failure_evidence(
+                    page, "fail-no-confirm-button", screenshot=False,
+                )
+            except Exception as exc:
+                logger.debug("Failure evidence capture failed: {}", exc)
             tracker.add_feedback("confirm_not_found")
             if candidate is not None:
                 tracker.finish_candidate(candidate, "automation_failure")
@@ -2282,6 +2467,10 @@ async def _book_slots_guarded(
             error=type(exc).__name__,
             detail=str(exc)[:200],
         )
+        try:
+            await _capture_failure_evidence(tab, "fail-lane-exception", screenshot=False)
+        except Exception:
+            pass
         if candidate is not None:
             tracker.finish_candidate(candidate, "automation_failure")
         return False
@@ -3280,6 +3469,9 @@ async def _run_booking_rush(
 
     remaining = config.preferences.weekly_max_slots
     logger.info("Rush mode: skipping quota check, assuming {} slots available", remaining)
+    # Same-run failed-slot memory (2026-09-17): after a cell fails to book,
+    # later picks prefer untried cells instead of hammering the same one.
+    failed_slot_keys: dict[tuple[str, str, str, str], float] = {}
     tracker.set_metric("rush_prefer_consecutive", config.settings.rush_prefer_consecutive)
     tracker.set_metric("rush_selection_mode", config.settings.rush_selection_mode)
     tracker.set_metric("min_slot_start", config.preferences.min_slot_start)
@@ -3791,10 +3983,16 @@ async def _run_booking_rush(
 
     def _first_acceptable_from_scan(
         all_date_slots: dict[date, List[TimeSlot]],
+        *,
+        center: str = "",
+        memory: dict[tuple[str, str, str, str], float] | None = None,
     ) -> tuple[date, List[TimeSlot]] | None:
         for target in target_dates:
             slots = all_date_slots.get(target, [])
-            best = find_best_booking(slots, remaining, config, rush=True, target=target)
+            best = _choose_rush_slots(
+                slots, remaining, config,
+                center=center, target=target, memory=memory or {},
+            )
             if best:
                 return target, best
         return None
@@ -4063,7 +4261,9 @@ async def _run_booking_rush(
                 continue
             center_name, by_date, rtt_ms = item
             tracker.set_metric(f"api_search_rtt_ms|{_metric_center_key(center_name)}", rtt_ms)
-            choice = _first_acceptable_from_scan(by_date)
+            choice = _first_acceptable_from_scan(
+                by_date, center=center_name, memory=failed_slot_keys,
+            )
             if choice is None:
                 continue
             target, best = choice
@@ -4194,6 +4394,10 @@ async def _run_booking_rush(
                         slots=[f"{s.start}-{s.end}" for s in best],
                         source="api_search",
                     )
+                    _note_failed_slots(
+                        failed_slot_keys, center=center_name, target=target,
+                        slots=best, reason="ui_after_api_search",
+                    )
                     async with booking_lock:
                         booking_claimed = False
                     return
@@ -4260,7 +4464,10 @@ async def _run_booking_rush(
             slots = all_date_slots.get(target, [])
             slots_seen_total += len(slots)
             tracker.set_metric("slots_seen_total", slots_seen_total)
-            best = find_best_booking(slots, remaining, config, rush=True, target=target)
+            best = _choose_rush_slots(
+                slots, remaining, config,
+                center=center_name, target=target, memory=failed_slot_keys,
+            )
             if not best:
                 tracker.add_feedback(
                     "no_slots",
@@ -4331,6 +4538,10 @@ async def _run_booking_rush(
             else:
                 tracker.add_feedback("booking_conflict", center=center_name, date=str(target),
                                      slots=[f"{s.start}-{s.end}" for s in best])
+                _note_failed_slots(
+                    failed_slot_keys, center=center_name, target=target,
+                    slots=best, reason="initial_wave",
+                )
                 logger.warning("Booking failed for {} on {}. Retrying same slot lane …", center_name, target)
                 for s in best:
                     if s in slots:
@@ -4446,7 +4657,10 @@ async def _run_booking_rush(
                     if remaining <= 0:
                         break
                     slots = all_date_slots.get(target, [])
-                    best = find_best_booking(slots, remaining, config, rush=True, target=target)
+                    best = _choose_rush_slots(
+                        slots, remaining, config,
+                        center=cn, target=target, memory=failed_slot_keys,
+                    )
                     if not best:
                         continue
 
@@ -4488,6 +4702,14 @@ async def _run_booking_rush(
                         logger.success("Wave {}: booked {} slot(s) on {} @ {}",
                                        wave, len(best), target, cn)
                         break
+                    tracker.add_feedback(
+                        "booking_conflict", center=cn, date=str(target),
+                        slots=[f"{s.start}-{s.end}" for s in best], wave=wave,
+                    )
+                    _note_failed_slots(
+                        failed_slot_keys, center=cn, target=target,
+                        slots=best, reason=f"wave{wave}",
+                    )
                     async with booking_lock:
                         booking_claimed = False
 

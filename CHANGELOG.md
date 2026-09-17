@@ -2,6 +2,43 @@
 
 All notable review and optimization changes are recorded here.
 
+## 2026-09-17
+
+- Morning rush lost (`COMPETITION_LOSS`, run `20260917-080012-25d7`, 4
+  attempts for 2026-09-24, no bookings).  Attempt 1 (Shaw Sports Complex,
+  via API search) died as `automation_failure` - the slot click never
+  registered.  Attempts 2-4 (Sports Practice Hall, waves 2-4) selected the
+  cell, armed Next and dispatched submits fine, but the server's
+  confirmation page never rendered inside the wait window
+  (`bot_latency_loss` x3).  The grid kept advertising 2 available cells for
+  9/24 across re-scans, so every wave re-picked the same 09:30-10:30 cell;
+  a read-only re-scan ~30 min later showed the date fully taken and My
+  Record carries no 9/24 booking.  Execution chain was green:
+  `actual_fire_delay_ms` 8.4ms, 0x403, API race 8/8 ok, all waves ran, no
+  lane crashes.
+- Failed-slot memory (same-run steering): `_note_failed_slots` remembers
+  every cell that fails a booking attempt (keyed center + date +
+  start-end); `_prefer_unfailed_slots` drops tried cells from later picks
+  while an untried acceptable cell remains, and falls back to the tried
+  cells when nothing else is left (retrying beats skipping - the 09-16 win
+  came from re-trying the same slot).  Wired into the initial claim loop,
+  the retry waves, and the API-search wave (`failed_slot_marked_count` /
+  `failed_slot_skip_count` metrics); wave failures now also emit
+  `booking_conflict` feedback with the wave number.
+- Failure evidence capture: `_capture_failure_evidence` archives url +
+  visible text (screenshot outside rush) under `logs/booking_evidence/`
+  whenever the confirm page never appears, a conflict is detected, no
+  confirm button is found, or a booking lane dies.  The 09-17 attribution
+  ("likely beaten on the server") had to be guessed from network events;
+  next time the server's own message is on disk (`failure_evidence_count` /
+  `failure_evidence_last`).
+- Scan logging lists the actual cells: "2 available slots
+  [08:30-09:30, 09:30-10:30]" instead of just the count, so the next
+  post-mortem can see which inventory was on screen.
+- Tests: new `tests/test_rush_slot_blacklist.py` (21 cases; suite 91 -> 112
+  passed) + live probe `tests/smoke_slot_memory.py` (steering, fallback,
+  live + closed-page evidence capture: ALL PASS).
+
 ## 2026-09-16
 
 - Morning rush WON on the crash-resilience build (`dac01da`): 9/23 Wed
