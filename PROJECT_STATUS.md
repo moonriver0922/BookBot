@@ -54,14 +54,69 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 - Adaptive tuning needs >=5 rush runs before it becomes ready.
 - Soft review budgets (e.g. candidate→confirm P90 2000ms) are monitoring thresholds,
   not the final beat-human targets (aim ~500–800ms once stable).
+- 09-17 loss mode: attempts can end with the server never rendering the
+  confirmation page (`bot_latency_loss`) and no ground truth of what the
+  server returned.  Failure evidence now dumps the rendered page
+  (`logs/booking_evidence/*-fail-*.txt`) so the next such loss is
+  self-explaining.
 
 ## Next Recommended Steps
 
 1. Next 08:30 rush: collect one complete war report chain (probes → source → latencies → result).
 2. Inspect `first_candidate_source` (API vs UI) before enabling `submit_canary`.
 3. After >=5 rush samples, run `adaptive-report` / daily review `--auto-tune`.
+4. 09-18 rush: watch `failed_slot_skip_count` and wave `booking_conflict`
+   feedback; on another confirm-page miss read the newest
+   `logs/booking_evidence/*-fail-confirm-missing*.txt` first.
 
 ## Recent Stage History
+
+## 2026-09-17 — Failed-slot memory + failure evidence (09-17 loss analysis)
+
+### Completed
+
+- Morning run `20260917-080012-25d7` FAILED — `COMPETITION_LOSS`, 4 attempts
+  for 2026-09-24, no bookings:
+  - attempt 1 (Shaw Sports Complex, via API search race): slot click never
+    registered → `automation_failure`;
+  - attempts 2-4 (Sports Practice Hall, waves 2-4): cell selected, armed
+    Next clicked, submits dispatched — but the server's confirmation page
+    never rendered inside the wait window → `bot_latency_loss` x3.
+  - The grid kept advertising 2 available cells for 9/24 across re-scans,
+    so every wave re-picked the same 09:30-10:30 cell.  A read-only re-scan
+    ~30 min later showed the date fully taken; My Record shows no 9/24
+    booking (no phantom success).
+  - Chain green: `actual_fire_delay_ms` 8.4ms, 0x403, API race 8/8 ok,
+    warmup 2/2, keepalive 6, all waves ran, no lane crashes.
+- Failed-slot memory: `_note_failed_slots` / `_prefer_unfailed_slots` /
+  `_choose_rush_slots` steer later picks to untried cells (keyed center +
+  date + start-end), with an honest fallback to tried cells when no
+  acceptable alternative remains.  Wired into the initial claim loop, the
+  retry waves, and the API-search wave; metrics `failed_slot_marked_count`
+  / `failed_slot_skip_count`; wave failures now emit `booking_conflict`
+  feedback with the wave number.
+- Failure evidence capture: `_capture_failure_evidence` archives url +
+  visible text (+screenshot outside rush) under `logs/booking_evidence/`
+  for confirm-missing / conflict / no-confirm-button / lane-exception
+  failures (`failure_evidence_count` / `failure_evidence_last`).
+- Scan logs now list the actual available cells per date instead of only
+  the count.
+
+### Validation
+
+- `pytest`: 112/112 (new `tests/test_rush_slot_blacklist.py`, 21 cases).
+- Live probe `tests/smoke_slot_memory.py`: ALL PASS — steering drops a
+  seeded cell in favour of a real alternative, single-cell fallback still
+  retries, live evidence capture wrote the real page, closed-page capture
+  degrades gracefully (TargetClosedError recorded, no raise).
+- Read-only: live re-scan of 9/24 after the loss (fully taken); My Record
+  check via `tests/smoke_verify_booking.py` (no phantom booking).
+
+### Git
+
+- Branch: `feature/rush-failed-slot-memory`
+- Commit: `0227708`
+- Push status: pushed
 
 ## 2026-09-16 — Live win #2 + booking evidence archive
 
