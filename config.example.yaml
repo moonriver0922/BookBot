@@ -47,7 +47,7 @@ settings:
   rush_selection_mode: "first_acceptable"  # first_acceptable | ranked
   rush_slot_select_timeout_ms: 200   # Wait for Next enable after slot click
   rush_confirm_page_timeout_ms: 800  # Wait for confirm page after Next
-  rush_confirm_result_timeout_ms: 1500  # Wait for confirm/result DOM
+  rush_confirm_result_timeout_ms: 3500  # Wait for confirm/result DOM (congested server needs 4-6s; 2026-09-18)
   rush_form_refresh_before_s: 150  # Re-render booking form at fire-150s; the site freezes CSRFToken into the Search handler at page load
   experiment_id: "baseline"       # Tag runs for A/B / gray rollout
   strategy_version: "rush-adaptive-v1"

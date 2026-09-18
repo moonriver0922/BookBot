@@ -446,3 +446,20 @@ class TestCrashPathRegression:
         assert page.confirm_clicks == 1  # booking still confirmed
         assert candidate["result"] == "booked"
         assert evidence_calls == [1]  # receipt archived on success
+
+
+# ---------------------------------------------------------------------------
+# Confirm-wait budget (2026-09-18)
+# ---------------------------------------------------------------------------
+
+def test_confirm_wait_budget_covers_slow_renders():
+    """The 09-18 loss: all four completed attempts bailed at
+    800+1500+1500=3.8s while the congested server needed ~4-6s to render the
+    confirm page (evidence captures show the "Do you want to book..." page
+    arriving moments after each bail).  Keep the total wait budget >= 7s."""
+    from bookbot.config import DEFAULTS, Settings
+
+    page_ms = Settings().rush_confirm_page_timeout_ms
+    result_ms = Settings().rush_confirm_result_timeout_ms
+    assert page_ms + 2 * result_ms >= 7000
+    assert DEFAULTS["settings"]["rush_confirm_result_timeout_ms"] == result_ms

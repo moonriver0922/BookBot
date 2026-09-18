@@ -28,7 +28,7 @@ ALLOWED_BOUNDARY_CANDIDATES = (-300, -200, -100, 0, 100, 200, 500)
 TIMEOUT_CAPS = {
     "rush_slot_select_timeout_ms": (100, 500),
     "rush_confirm_page_timeout_ms": (300, 1500),
-    "rush_confirm_result_timeout_ms": (500, 3000),
+    "rush_confirm_result_timeout_ms": (500, 6000),
 }
 
 

@@ -2,6 +2,33 @@
 
 All notable review and optimization changes are recorded here.
 
+## 2026-09-18
+
+- Morning rush lost (`COMPETITION_LOSS`, run `20260918-080014-e953`, 5
+  attempts for 2026-09-25) - but the new failure-evidence capture turned the
+  post-mortem into a root cause instead of a guess.  The four "confirmation
+  page never appeared" captures (`logs/booking_evidence/*-fail-confirm-missing*`)
+  all show the site's actual confirm page ("Do you want to book the following
+  facility? ... Submit / Back") rendered moments *after* the run gave up:
+  the confirm-page wait budget (800 + 1500 + 1500 = 3.8s) is too tight when
+  the congested server needs ~4-6s to render that page (today: API search rtt
+  29.2s, first timetable +16.0s).  Bail timestamps vs capture timestamps show
+  misses of ~0.2-2s per attempt.  Chain otherwise green
+  (`actual_fire_delay_ms` 3.6ms, 0x403, API race 8/8 ok, keepalive 6), and
+  both 09-17 additions worked live: failed-slot memory
+  (`failed_slot_marked_count` 5 / `failed_slot_skip_count` 1 - wave 1 moved
+  from the already-failed PH 09:30 cell to the untried PH 10:30-11:30) and
+  the evidence capture itself (4 files).
+- Confirm-wait budget: `rush_confirm_result_timeout_ms` 1500 -> 3500 (total
+  wait 800 + 3500 + 3500 = 7.8s; the tight first budget still fast-paths
+  healthy renders).  Defaults updated in `bookbot/config.py` + `booker.py`
+  fallback; adaptive cap for the knob (500, 3000) -> (500, 6000); the run
+  snapshot now records the value so future runs are self-verifying.
+- Candidate bookkeeping: the api-search-hit lane's failure branch now closes
+  a still-open candidate (`automation_failure`) - 09-18 attempt 2 left one
+  'pending'.
+- Tests: confirm-wait budget floor test (total >= 7s); suite 112 -> 113.
+
 ## 2026-09-17
 
 - Morning rush lost (`COMPETITION_LOSS`, run `20260917-080012-25d7`, 4

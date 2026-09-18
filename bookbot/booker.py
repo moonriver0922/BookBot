@@ -2181,7 +2181,7 @@ async def book_slots(page: Page, slots_to_book: List[TimeSlot], target: date, co
 
     select_timeout = int(getattr(config.settings, "rush_slot_select_timeout_ms", 200) or 200)
     confirm_page_timeout = int(getattr(config.settings, "rush_confirm_page_timeout_ms", 800) or 800)
-    confirm_result_timeout = int(getattr(config.settings, "rush_confirm_result_timeout_ms", 1500) or 1500)
+    confirm_result_timeout = int(getattr(config.settings, "rush_confirm_result_timeout_ms", 3500) or 3500)
 
     # ── Step 1: Click slot cells ──
     if rush:
@@ -4398,6 +4398,10 @@ async def _run_booking_rush(
                         failed_slot_keys, center=center_name, target=target,
                         slots=best, reason="ui_after_api_search",
                     )
+                    # 2026-09-18: a lane that dies before book_slots reaches its
+                    # own finish paths would leave the candidate 'pending'.
+                    if candidate is not None and not candidate.get("result"):
+                        tracker.finish_candidate(candidate, "automation_failure")
                     async with booking_lock:
                         booking_claimed = False
                     return
