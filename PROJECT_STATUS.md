@@ -71,6 +71,53 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 
 ## Recent Stage History
 
+## 2026-09-18 — Confirm-wait budget (4x "confirm page never appeared" was OUR window, not the server)
+
+### Completed
+
+- Morning run `20260918-080014-e953` FAILED — `COMPETITION_LOSS`, 5 attempts
+  on 2026-09-25, no bookings; now with a proven root cause thanks to the new
+  failure-evidence captures:
+  - attempts 1/3/4/5 all died `bot_latency_loss` after `confirmation_page_too_slow`
+    (800ms fast budget) + both grace/load-state stages expired at 3.8s total;
+  - the four `fail-confirm-missing` captures show the server's actual confirm
+    page ("Do you want to book the following facility? ... Submit/Back") for
+    the exact slot each attempt had selected — rendered moments after the
+    bail (attempt 3's PH Court 7 10:30-11:30 page was fully readable at
+    bail+~0.1s; attempt 1's capture could not even read the body yet);
+  - under today's load (API search rtt 29.2s; first timetable +16.0s; confirm
+    pages ~4-6s to render) the 3.8s window consistently closed ~0.2-2s before
+    the page arrived.  Substantively not a competition loss: the confirm
+    pages were live offers we never reached tick+Submit on.
+  - attempt 2 (api-search-hit lane, Main 09:30) died at slot selection and
+    left its candidate 'pending' (bookkeeping fixed below).
+  - both 09-17 additions worked live: failed-slot memory (marked 5, skipped 1
+    — wave 1 moved from failed PH 09:30 to untried PH 10:30-11:30) and the
+    evidence capture (4 files).
+  - Chain green: fire 3.6ms, 0x403, API race 8/8 ok, warmup 2/2, keepalive 6.
+- Fix: `rush_confirm_result_timeout_ms` 1500 -> 3500 (total 7.8s = 800 +
+  2x3500; the tight first budget is unchanged for fast renders).  Live +
+  example configs, `config.py` defaults (dict + dataclass), `booker.py`
+  fallback, adaptive cap high 3000 -> 6000, and the run snapshot (now records
+  the value) all updated.
+- Candidate bookkeeping: the api-search-hit failure branch finishes a
+  still-open candidate as `automation_failure`.
+
+### Validation
+
+- `pytest`: 113/113 (new confirm-wait budget floor test).
+- Live smoke `tests/smoke_crash_resilience.py` re-run: A1/A2 context-loss
+  survival, checkbox tick (1 on live page, 0 during nav race, no raises),
+  confirm-wait returns without hanging — all pass.
+- Evidence review: the four 09-18 captures read and matched to their attempt
+  slots (PH 10:30-11:30, PH 09:30-10:30, Main 09:30-10:30).
+
+### Git
+
+- Branch: `feature/confirm-wait-budget`
+- Commit: `4dfe7d5`
+- Push status: pushed
+
 ## 2026-09-17 — Failed-slot memory + failure evidence (09-17 loss analysis)
 
 ### Completed
