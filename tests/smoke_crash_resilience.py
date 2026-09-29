@@ -9,6 +9,7 @@ is interrupted by a real navigation (its context is destroyed mid-flight).
   B)  _tick_confirm_checkboxes on a live page            -> int, never raises
   B2) _tick_confirm_checkboxes during a navigation race  -> same
   C)  _await_confirmation_page on a live page            -> bool, never hangs
+  D)  _click_slots_js / _find_slot_cell during a nav race -> int / None, no raise
 
     cd "<proj>" && .venv/bin/python tests/smoke_crash_resilience.py
 """
@@ -17,7 +18,8 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-from datetime import datetime
+from datetime import date, datetime
+from types import SimpleNamespace
 
 PROJ = "/Users/wangguosheng/Nutstore Files/.symlinks/Nutstore/BookBot"
 sys.path.insert(0, PROJ)
@@ -60,6 +62,9 @@ class _T:
 
     def set_metric(self, name, value):
         self._metrics[name] = value
+
+    def incr_metric(self, name, delta=1):
+        self._metrics[name] = self._metrics.get(name, 0) + delta
 
 
 NAV_JS = (
@@ -138,6 +143,31 @@ async def main():
             except Exception as exc:
                 log("B2 tick during nav race -> RAISED:", str(exc)[:160])
             await nav3
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=8000)
+            except Exception:
+                pass
+
+            # ── D) slot-click evaluators DURING a navigation race (2026-09-29) ──
+            await booker._ensure_booking_form(page, config, rush=True)
+            slot_stub = SimpleNamespace(start="09:30", end="10:30")
+            nav4 = asyncio.create_task(
+                page.goto(booker.BOOKING_URL, wait_until="commit")
+            )
+            await asyncio.sleep(0.05)
+            try:
+                dn = await booker._click_slots_js(
+                    page, [slot_stub], date.today(), config,
+                )
+                log("D click_slots_js during nav race ->", dn, "(int, no raise)")
+            except Exception as exc:
+                log("D click_slots_js during nav race -> RAISED:", str(exc)[:160])
+            try:
+                dh = await booker._find_slot_cell(page, slot_stub, date.today(), config)
+                log("D find_slot_cell during nav race ->", type(dh).__name__, "(no raise)")
+            except Exception as exc:
+                log("D find_slot_cell during nav race -> RAISED:", str(exc)[:160])
+            await nav4
             try:
                 await page.wait_for_load_state("domcontentloaded", timeout=8000)
             except Exception:

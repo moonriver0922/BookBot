@@ -2,6 +2,37 @@
 
 All notable review and optimization changes are recorded here.
 
+## 2026-09-29
+
+- Pre-rush hardening after auditing the two losses that followed the
+  confirm-wait fix, ahead of the 09-30 reopening:
+  - 09-20 (`20260920-080013-4c3e`): the site itself returned its
+    "There is a problem ... try again" error page (server-side) plus late-run
+    competition - nothing addressable in code;
+  - 09-21 (`20260921-080010-784c`): the Main lane died with "Execution
+    context was destroyed" - the 09-15 crash signature's third occurrence,
+    this time raised from `_click_slots_js`.  On both 09-17 and 09-21 the
+    lane was clicking its timetable cell while the search it had fired
+    moments earlier was still landing its navigation; the navigation
+    destroyed the JS context mid-script.  The lane guard contained the crash,
+    but that lane was the run's only completed attempt.
+- `_click_slots_js` / `_find_slot_cell` (the last two unguarded raw-evaluate
+  call sites on the rush hot path) now tolerate a mid-flight context loss:
+  bounded retries (3) wait for the fresh document (domcontentloaded +
+  timetable re-attach via new `_await_fresh_page`) and re-run against the
+  new DOM; if the context keeps dying they fail cleanly (0 / None) instead
+  of taking the lane down.  Non-navigation errors still raise.
+- New metrics `slot_click_ctx_loss_count` / `slot_click_ctx_giveup_count` /
+  `find_cell_ctx_loss_count` / `find_cell_ctx_giveup_count`; a give-up also
+  leaves a `slot_click_ctx_lost` feedback entry.
+- `_find_slot_cell` returns None on give-up; both `book_slots` call sites
+  guard for the None handle.
+- Tests: suite 113 -> 121 (retry / give-up / clean-zero / non-navigation
+  errors per evaluator + an end-to-end regression where the 09-21 crash path
+  recovers and books).  Live smoke gained section D and reproduced the crash
+  condition on the live site: context lost mid-evaluate -> retried ->
+  returned 0, no raise.
+
 ## 2026-09-18
 
 - Morning rush lost (`COMPETITION_LOSS`, run `20260918-080014-e953`, 5

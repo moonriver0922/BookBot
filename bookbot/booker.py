@@ -1505,13 +1505,37 @@ def _choose_rush_slots(
 # Book execution
 # ---------------------------------------------------------------------------
 
+async def _await_fresh_page(page: Page, selector: str | None = None) -> None:
+    """Best-effort wait for the fresh document after the JS context was lost.
+
+    2026-09-29: a hot-path evaluation can be torn down mid-flight by a page
+    navigation (the search fired moments earlier still landing).  Before
+    retrying against the new document we give it a bounded chance to load
+    and, when a selector is given, to expose the element the caller needs.
+    Never raises.
+    """
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=1200)
+    except Exception:
+        pass
+    if selector:
+        try:
+            await page.wait_for_selector(selector, state="attached", timeout=1800)
+        except Exception:
+            pass
+
+
 async def _find_slot_cell(page: Page, slot: TimeSlot, target: date, config: AppConfig):
-    """Locate the timetable cell element for a given time slot on the target date."""
+    """Locate the timetable cell element for a given time slot on the target date.
+
+    2026-09-29: tolerates losing the JS context to a navigation (same class as
+    `_click_slots_js`); on repeated loss returns None instead of raising so the
+    caller can fail cleanly rather than lose the lane.
+    """
     target_day = target.strftime("%d %b")
 
     table_selector = config.selectors.timetable
-    cell = await page.evaluate_handle(
-        """({ targetDay, startTime, endTime, tableSelector }) => {
+    script = """({ targetDay, startTime, endTime, tableSelector }) => {
             const tables = document.querySelectorAll(tableSelector);
             if (tables.length < 2) return null;
 
@@ -1546,15 +1570,38 @@ async def _find_slot_cell(page: Page, slot: TimeSlot, target: date, config: AppC
             if (!dataRow) return null;
             const cells = dataRow.querySelectorAll('td');
             return colIdx < cells.length ? cells[colIdx] : null;
-        }""",
-        {
-            "targetDay": target_day,
-            "startTime": slot.start,
-            "endTime": slot.end,
-            "tableSelector": table_selector,
-        },
-    )
-    return cell
+        }"""
+    args = {
+        "targetDay": target_day,
+        "startTime": slot.start,
+        "endTime": slot.end,
+        "tableSelector": table_selector,
+    }
+
+    retries = 3
+    for attempt in range(1, retries + 1):
+        try:
+            return await page.evaluate_handle(script, args)
+        except Exception as exc:  # noqa: BLE001 — classified below
+            if not _is_context_lost(exc):
+                raise
+            try:
+                tracker.incr_metric("find_cell_ctx_loss_count")
+            except Exception:
+                pass
+            logger.warning(
+                "find_slot_cell lost its JS context (attempt {}/{}), retrying: {}",
+                attempt, retries, exc,
+            )
+            await _await_fresh_page(page, table_selector)
+            await asyncio.sleep(0.05 * attempt)
+
+    try:
+        tracker.incr_metric("find_cell_ctx_giveup_count")
+    except Exception:
+        pass
+    logger.warning("find_slot_cell gave up after {} context losses — returning None", retries)
+    return None
 
 
 BOOKING_CONFLICT_MARKERS = [
@@ -1608,12 +1655,18 @@ async def _click_slots_js(page: Page, slots: List[TimeSlot], target: date, confi
     (e.g. <a>, <div>, <span> with onclick).  We must click the innermost
     interactive element, not the bare <td>, otherwise the selection doesn't
     register and the Next button stays disabled.
+
+    2026-09-29: the 09-17 and 09-21 rushes died with "Execution context was
+    destroyed" raised from this evaluation — the search fired moments earlier
+    in the same lane can still be landing its navigation, which tears down the
+    JS context mid-script.  It now retries against the fresh document (bounded)
+    and returns 0 if the context keeps dying, so the attempt fails cleanly
+    instead of taking the whole lane down.
     """
     target_day = target.strftime("%d %b")
     slot_data = [{"start": s.start, "end": s.end} for s in slots]
     table_selector = config.selectors.timetable
-    return await page.evaluate(
-        """({ targetDay, slots, tableSelector }) => {
+    script = """({ targetDay, slots, tableSelector }) => {
             const tables = document.querySelectorAll(tableSelector);
             if (tables.length < 2) return 0;
 
@@ -1675,9 +1728,39 @@ async def _click_slots_js(page: Page, slots: List[TimeSlot], target: date, confi
                 }
             }
             return clicked;
-        }""",
-        {"targetDay": target_day, "slots": slot_data, "tableSelector": table_selector},
-    )
+        }"""
+    args = {"targetDay": target_day, "slots": slot_data, "tableSelector": table_selector}
+
+    retries = 3
+    for attempt in range(1, retries + 1):
+        try:
+            clicked = await page.evaluate(script, args)
+            return int(clicked or 0)
+        except Exception as exc:  # noqa: BLE001 — classified below
+            if not _is_context_lost(exc):
+                raise
+            try:
+                tracker.incr_metric("slot_click_ctx_loss_count")
+            except Exception:
+                pass
+            logger.warning(
+                "click_slots_js lost its JS context (attempt {}/{}), retrying: {}",
+                attempt, retries, exc,
+            )
+            await _await_fresh_page(page, table_selector)
+            await asyncio.sleep(0.05 * attempt)
+
+    try:
+        tracker.incr_metric("slot_click_ctx_giveup_count")
+        tracker.add_feedback(
+            "slot_click_ctx_lost",
+            attempts=retries,
+            slots=[f"{s.start}-{s.end}" for s in slots],
+        )
+    except Exception:
+        pass
+    logger.warning("click_slots_js gave up after {} context losses — returning 0", retries)
+    return 0
 
 
 # ── Endgame: armed Next click (2026-09-12 post-mortem) ──────────────────────
@@ -2211,7 +2294,7 @@ async def book_slots(page: Page, slots_to_book: List[TimeSlot], target: date, co
                 booked_count = 0
                 for slot in slots_to_book:
                     cell_handle = await _find_slot_cell(page, slot, target, config)
-                    el = cell_handle.as_element()
+                    el = cell_handle.as_element() if cell_handle is not None else None
                     if el:
                         await el.click()
                         booked_count += 1
@@ -2248,7 +2331,7 @@ async def book_slots(page: Page, slots_to_book: List[TimeSlot], target: date, co
         for slot in slots_to_book:
             logger.info("Attempting to book {} – {} …", slot.start, slot.end)
             cell_handle = await _find_slot_cell(page, slot, target, config)
-            el = cell_handle.as_element()
+            el = cell_handle.as_element() if cell_handle is not None else None
             if el:
                 await el.scroll_into_view_if_needed()
                 await human_delay(0.3, 0.8)

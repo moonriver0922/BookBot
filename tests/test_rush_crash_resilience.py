@@ -463,3 +463,172 @@ def test_confirm_wait_budget_covers_slow_renders():
     result_ms = Settings().rush_confirm_result_timeout_ms
     assert page_ms + 2 * result_ms >= 7000
     assert DEFAULTS["settings"]["rush_confirm_result_timeout_ms"] == result_ms
+
+
+# ---------------------------------------------------------------------------
+# Hot-path evaluators: navigation-tolerant slot clicks (2026-09-29)
+# ---------------------------------------------------------------------------
+# 09-17 and 09-21 died with "Execution context was destroyed" raised from
+# _click_slots_js: the search fired moments earlier in the same lane can still
+# be landing its navigation, tearing down the JS context mid-script.  Both
+# hot-path evaluators now retry against the fresh document (bounded) and fail
+# cleanly (0 / None) instead of losing the lane.
+
+def _slot_stub(start="09:30", end="10:30"):
+    return SimpleNamespace(start=start, end=end)
+
+
+class SlotEvalPage:
+    """Fake page for _click_slots_js: pops one result per evaluate call."""
+
+    def __init__(self, results):
+        self._results = list(results)
+        self.evaluate_calls = 0
+        self.settle_calls = 0
+        self.selector_waits = 0
+        self.url = "https://x/timetable"
+
+    async def evaluate(self, script, arg=None):
+        self.evaluate_calls += 1
+        result = self._results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    async def wait_for_load_state(self, state, timeout=None):
+        self.settle_calls += 1
+
+    async def wait_for_selector(self, selector, timeout=None, state=None):
+        self.selector_waits += 1
+
+
+class SlotHandlePage(SlotEvalPage):
+    """Same, for _find_slot_cell (evaluate_handle)."""
+
+    async def evaluate_handle(self, script, arg=None):
+        self.evaluate_calls += 1
+        result = self._results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+def _slot_cfg():
+    return SimpleNamespace(selectors=SimpleNamespace(timetable="table#t"))
+
+
+class TestClickSlotsJsNavTolerance:
+    def test_retries_after_context_loss(self, fake_tracker):
+        page = SlotEvalPage([_ctx_lost(), 2])
+        out = asyncio.run(
+            booker._click_slots_js(page, [_slot_stub()], date(2026, 10, 7), _slot_cfg())
+        )
+        assert out == 2
+        assert page.evaluate_calls == 2
+        assert page.settle_calls == 1  # waited for the fresh page
+        assert page.selector_waits == 1  # …and for the timetable to re-attach
+        assert fake_tracker._metrics.get("slot_click_ctx_loss_count") == 1
+
+    def test_giveup_returns_zero_with_feedback(self, fake_tracker):
+        page = SlotEvalPage([_ctx_lost(), _ctx_lost(), _ctx_lost()])
+        out = asyncio.run(
+            booker._click_slots_js(page, [_slot_stub()], date(2026, 10, 7), _slot_cfg())
+        )
+        assert out == 0
+        assert page.evaluate_calls == 3
+        assert fake_tracker._metrics.get("slot_click_ctx_loss_count") == 3
+        assert fake_tracker._metrics.get("slot_click_ctx_giveup_count") == 1
+        assert any(f["reason"] == "slot_click_ctx_lost" for f in fake_tracker.feedback)
+
+    def test_non_navigation_errors_still_raise(self, fake_tracker):
+        page = SlotEvalPage([RuntimeError("syntax error in injected script")])
+        with pytest.raises(RuntimeError):
+            asyncio.run(
+                booker._click_slots_js(page, [_slot_stub()], date(2026, 10, 7), _slot_cfg())
+            )
+
+    def test_clean_zero_is_not_retried(self, fake_tracker):
+        page = SlotEvalPage([0])
+        out = asyncio.run(
+            booker._click_slots_js(page, [_slot_stub()], date(2026, 10, 7), _slot_cfg())
+        )
+        assert out == 0
+        assert page.evaluate_calls == 1
+
+
+class TestFindSlotCellNavTolerance:
+    def test_retries_after_context_loss(self, fake_tracker):
+        handle = object()
+        page = SlotHandlePage([_ctx_lost(), handle])
+        out = asyncio.run(
+            booker._find_slot_cell(page, _slot_stub(), date(2026, 10, 7), _slot_cfg())
+        )
+        assert out is handle
+        assert page.evaluate_calls == 2
+        assert fake_tracker._metrics.get("find_cell_ctx_loss_count") == 1
+
+    def test_giveup_returns_none(self, fake_tracker):
+        page = SlotHandlePage([_ctx_lost(), _ctx_lost(), _ctx_lost()])
+        out = asyncio.run(
+            booker._find_slot_cell(page, _slot_stub(), date(2026, 10, 7), _slot_cfg())
+        )
+        assert out is None
+        assert fake_tracker._metrics.get("find_cell_ctx_giveup_count") == 1
+
+    def test_non_navigation_errors_still_raise(self, fake_tracker):
+        page = SlotHandlePage([RuntimeError("boom")])
+        with pytest.raises(RuntimeError):
+            asyncio.run(
+                booker._find_slot_cell(page, _slot_stub(), date(2026, 10, 7), _slot_cfg())
+            )
+
+
+class BookSlotsSlotClickRecoverPage(BookSlotsStubPage):
+    """The slot-click evaluation loses its context once, then succeeds."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.slot_click_attempts = 0
+
+    async def evaluate(self, script, arg=None):
+        if "tables" in script and "clicked" in script:
+            self.slot_click_attempts += 1
+            if self.slot_click_attempts == 1:
+                raise _ctx_lost()
+            return 2
+        return await super().evaluate(script, arg)
+
+
+class TestSlotClickContextLossRegression:
+    def test_lane_recovers_and_books(self, fake_tracker, monkeypatch):
+        """09-17/09-21: this raised and killed the lane; now it retries and books."""
+
+        async def fake_next_click(*args, **kwargs):
+            return True
+
+        monkeypatch.setattr(booker, "_click_next_fast", fake_next_click)
+
+        async def fake_evidence(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(booker, "_save_booking_evidence", fake_evidence)
+
+        page = BookSlotsSlotClickRecoverPage()
+        slots = [
+            SimpleNamespace(start="09:30", end="10:30"),
+            SimpleNamespace(start="10:30", end="11:30"),
+        ]
+        candidate: dict = {}
+
+        ok = asyncio.run(
+            booker.book_slots(
+                page, slots, date(2026, 10, 7), _stub_config(),
+                rush=True, candidate=candidate,
+            )
+        )
+
+        assert ok is True  # 09-17/09-21: the lane died here instead
+        assert page.slot_click_attempts == 2  # ctx lost once, retried on fresh page
+        assert fake_tracker._metrics.get("slot_click_ctx_loss_count") == 1
+        assert candidate["result"] == "booked"
+
