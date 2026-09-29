@@ -71,6 +71,53 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 
 ## Recent Stage History
 
+## 2026-09-29 — Slot-click navigation tolerance (09-21 lane-death root cause)
+
+### Completed
+
+- Audited the two losses after the confirm-wait fix (pre-rush hardening
+  ahead of the 09-30 reopening):
+  - 09-20 `20260920-080013-4c3e`: the site itself returned its
+    "There is a problem. Please click below link to try again." page
+    (server-side failure) plus late-run competition - not addressable in code.
+  - 09-21 `20260921-080010-784c`: the Main lane died with "Execution context
+    was destroyed" - the 09-15 crash signature's third occurrence, this time
+    raised from `_click_slots_js`.  On both 09-17 and 09-21 the lane was
+    clicking its timetable cell while the search it had fired moments earlier
+    was still landing its navigation; the navigation destroyed the JS context
+    mid-script.  The lane guard contained the crash, but that lane was the
+    run's only completed attempt - the morning was lost to a local crash, not
+    to competition.
+- Fix: `_click_slots_js` and `_find_slot_cell` (the last two unguarded
+  raw-evaluate call sites on the rush hot path) now tolerate a mid-flight
+  context loss - bounded retries (3) that wait for the fresh document
+  (domcontentloaded + timetable re-attach via new `_await_fresh_page`) and
+  re-run against the new DOM; if the context keeps dying they fail cleanly
+  (0 / None + metrics/feedback) instead of killing the lane.  Non-navigation
+  errors still raise.
+- Metrics: `slot_click_ctx_loss_count`, `slot_click_ctx_giveup_count`,
+  `find_cell_ctx_loss_count`, `find_cell_ctx_giveup_count`; a give-up leaves
+  a `slot_click_ctx_lost` feedback entry.
+- `_find_slot_cell` returns None on give-up; both `book_slots` call sites
+  (rush native fallback + non-rush) guard for the None handle.
+
+### Validation
+
+- `pytest`: 121/121 (suite 113 -> 121: per-evaluator retry / give-up /
+  clean-zero / non-navigation-raises tests + an end-to-end regression
+  asserting the 09-21 crash path now recovers and books).
+- Live smoke `tests/smoke_crash_resilience.py` (section D added): under a
+  real navigation race on the live POSS site, `_click_slots_js` lost its JS
+  context mid-evaluate, retried, and returned 0 with no raise;
+  `_find_slot_cell` returned a handle with no raise; A1/A2/B/B2/C all still
+  pass (no regression on the 09-15 machinery).
+
+### Git
+
+- Branch: `feature/slot-click-nav-resilience`
+- Commit: `536d29d`
+- Push status: pushed
+
 ## 2026-09-18 — Confirm-wait budget (4x "confirm page never appeared" was OUR window, not the server)
 
 ### Completed
