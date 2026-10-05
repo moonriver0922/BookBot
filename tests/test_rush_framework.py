@@ -96,6 +96,65 @@ def test_monday_weekday_window_blocks_afternoon_in_rush():
     assert reason2 == "no_slots"
 
 
+def test_all_search_paths_403_are_not_misclassified_as_no_inventory():
+    cls, reason = classify_run(
+        success=False,
+        events=[{"reason": "no_slots"}, {"reason": "no_bookings_made"}],
+        metrics={
+            "api_search_attempt_count": 8,
+            "api_search_403_count": 8,
+            "api_search_fail_count": 8,
+            "api_search_ok_count": 0,
+            "search_403_count": 5,
+        },
+    )
+    assert cls == "SEARCH_FAILURE"
+    assert reason == "search_403"
+
+
+def test_partial_403_with_successful_api_search_can_still_mean_no_inventory():
+    cls, reason = classify_run(
+        success=False,
+        events=[{"reason": "no_slots"}, {"reason": "no_bookings_made"}],
+        metrics={
+            "api_search_attempt_count": 8,
+            "api_search_403_count": 2,
+            "api_search_fail_count": 2,
+            "api_search_ok_count": 6,
+            "search_403_count": 1,
+        },
+    )
+    assert cls == "NO_INVENTORY"
+    assert reason == "no_slots"
+
+
+def test_run_report_exposes_403_search_health(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("bookbot.tracker.LOGS_DIR", tmp_path)
+    monkeypatch.setattr("bookbot.tracker.REPORTS_DIR", tmp_path / "reports")
+    tracker = _Tracker()
+    tracker.start_run(mode="rush", experiment_id="exp-403", strategy_version="v-test")
+    tracker.mark_rush_start()
+    tracker.add_feedback("no_slots")
+    for key, value in {
+        "api_search_attempt_count": 8,
+        "api_search_403_count": 8,
+        "api_search_fail_count": 8,
+        "api_search_ok_count": 0,
+        "search_403_count": 5,
+        "search_403_heal_count": 2,
+        "search_403_heal_refire_count": 1,
+        "search_403_heal_fail_count": 1,
+    }.items():
+        tracker.set_metric(key, value)
+
+    report = tracker.finish_run(success=False)
+    text = report.read_text(encoding="utf-8")
+    assert "SEARCH_FAILURE (search_403)" in text
+    assert "api_search_403" in text and "8" in text
+    assert "search_403_heal_fail" in text and "1" in text
+    assert "HTTP 403" in text
+
+
 def test_classify_automation_beats_ambiguous_competition():
     cls, reason = classify_run(
         success=False,

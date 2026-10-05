@@ -2,6 +2,30 @@
 
 All notable review and optimization changes are recorded here.
 
+## 2026-10-05
+
+- Re-reviewed the 2026-10-03 run (`20261003-080005-ee6b`): rush opened
+  on time, but the API search had 8/8 failures (all 403), the browser path
+  recorded 5 search 403s, and there was no successful API result, candidate,
+  or submit.  The existing classifier reported `NO_INVENTORY` from generic
+  `no_slots` feedback, which overstated what the run had actually observed.
+  Two form tabs refreshed successfully; token healing ran twice, refired once,
+  and recorded one heal failure.  The available evidence does **not** establish
+  why POSS returned 403 (token, session, and upstream causes remain open).
+- Failure taxonomy now classifies a no-candidate run as
+  `SEARCH_FAILURE (search_403)` when browser 403 evidence coincides with no
+  successful API search (and all attempted API searches failed with 403).
+  Explicit booking conflicts and other specific failures retain precedence;
+  a partial 403 with successful API search can still be `NO_INVENTORY`.
+- Rush reports now include API/browser 403 and token-heal counters, and the
+  403 diagnosis explicitly says inventory was not verified.  This makes the
+  next live report actionable without pretending the underlying 403 cause is
+  known.
+- Validation: regression tests reproduce the 10-03 metric pattern and check
+  partial-403 behavior/report output; full suite **124/124 passed**.  No live
+  POSS booking request was made (this change affects only classification and
+  reporting).
+
 ## 2026-09-29
 
 - Pre-rush hardening after auditing the two losses that followed the

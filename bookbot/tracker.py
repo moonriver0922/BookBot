@@ -375,6 +375,23 @@ class _Tracker:
             if isinstance(value, (int, float)):
                 critical_lines.append(f"{name:<28} {value:.0f} ms")
 
+        search_health_lines = []
+        search_health_metrics = (
+            ("api_search_attempts", "api_search_attempt_count"),
+            ("api_search_ok", "api_search_ok_count"),
+            ("api_search_fail", "api_search_fail_count"),
+            ("api_search_403", "api_search_403_count"),
+            ("browser_search_403", "search_403_count"),
+            ("search_403_heal_rounds", "search_403_heal_count"),
+            ("search_403_heal_refire", "search_403_heal_refire_count"),
+            ("search_403_heal_fail", "search_403_heal_fail_count"),
+        )
+        if any(key in m for _, key in search_health_metrics):
+            for label, key in search_health_metrics:
+                value = m.get(key, 0)
+                if isinstance(value, (int, float)):
+                    search_health_lines.append(f"{label:<28} {value:.0f}")
+
         diagnosis = self._diagnose(success=success)
         body = "\n".join(
             [
@@ -395,6 +412,7 @@ class _Tracker:
                 "",
                 "Critical metrics:",
                 *(critical_lines or ["(none)"]),
+                *(["", "Search health:", *search_health_lines] if search_health_lines else []),
                 "",
                 "Diagnosis:",
                 diagnosis,
@@ -447,6 +465,17 @@ class _Tracker:
         if cls == "SERVER_FAILURE":
             return "Upstream server rejected or blocked the session."
         if cls == "SEARCH_FAILURE":
+            if self._primary_reason == "search_403":
+                if not self._metrics.get("api_search_attempt_count"):
+                    return (
+                        "Browser search returned HTTP 403 and no API search was attempted; "
+                        "inventory was not verified.\n"
+                        "Do not classify this as no inventory; inspect session and form state."
+                    )
+                return (
+                    "Browser and API search paths returned HTTP 403; inventory was not verified.\n"
+                    "Do not classify this as no inventory; inspect form refresh and token-heal outcomes."
+                )
             return "Search/timetable path failed before candidates could be evaluated."
         return "Insufficient signal to diagnose; inspect feedback events."
 

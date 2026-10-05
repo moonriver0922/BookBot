@@ -49,6 +49,7 @@ _REASON_TO_CLASS: dict[str, str] = {
     "search_timeout": "SEARCH_FAILURE",
     "timetable_not_rendered": "SEARCH_FAILURE",
     "search_server_error": "SEARCH_FAILURE",
+    "search_403": "SEARCH_FAILURE",
     "tab_scan_failed": "SEARCH_FAILURE",
     "no_slots": "NO_INVENTORY",
     "no_slots_visible": "NO_INVENTORY",
@@ -95,6 +96,38 @@ def _saw_candidate(reasons: list[str], metrics: dict[str, Any]) -> bool:
     return False
 
 
+def _search_403_blocked(metrics: dict[str, Any]) -> bool:
+    """Return true when 403s leave no usable inventory-search source.
+
+    A transient API 403 alone is not enough: a successful API search may still
+    establish that inventory was empty.  For the dual-path rush case, require
+    browser 403 evidence and either no API attempts or every API attempt to
+    have failed with 403 and no successful API result.
+    """
+    browser_403 = _metric_count(metrics, "search_403_count") > 0
+    if not browser_403:
+        return False
+
+    api_attempts = _metric_count(metrics, "api_search_attempt_count")
+    if api_attempts == 0:
+        return True
+
+    return (
+        _metric_count(metrics, "api_search_403_count") >= api_attempts
+        and _metric_count(metrics, "api_search_fail_count") >= api_attempts
+        and _metric_count(metrics, "api_search_ok_count") == 0
+    )
+
+
+def _metric_count(metrics: dict[str, Any], key: str) -> int:
+    value = metrics.get(key, 0)
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    return 0
+
+
 def classify_run(
     *,
     success: bool,
@@ -109,7 +142,8 @@ def classify_run(
       1. Explicit server conflict / occupied → COMPETITION_LOSS
       2. Explicit click / Next / Confirm / latency faults → AUTOMATION / BOT_LATENCY / …
       3. Candidate seen + no booking, no hard evidence → POSSIBLE_COMPETITION_LOSS
-      4. No candidate → NO_INVENTORY when inventory signals present
+      4. No candidate + verified usable search → NO_INVENTORY
+      5. Search blocked by 403 with no usable path → SEARCH_FAILURE
     """
     metrics = metrics or {}
     if success:
@@ -139,8 +173,6 @@ def classify_run(
         "SEARCH_FAILURE",
         "AUTOMATION_FAILURE",
         "BOT_LATENCY_LOSS",
-        "NO_INVENTORY",
-        "POSSIBLE_COMPETITION_LOSS",
     ]
     classified = [(classify_reason(r), r) for r in reasons]
     for wanted in priority:
@@ -149,6 +181,13 @@ def classify_run(
                 return cls, reason
 
     saw_candidate = _saw_candidate(reasons, metrics)
+    if not saw_candidate and _search_403_blocked(metrics):
+        return "SEARCH_FAILURE", "search_403"
+
+    for wanted in ("NO_INVENTORY", "POSSIBLE_COMPETITION_LOSS"):
+        for cls, reason in classified:
+            if cls == wanted:
+                return cls, reason
 
     # 3) Ambiguous: saw inventory but no booking and no stronger signal.
     if saw_candidate and "no_bookings_made" in reason_set:
