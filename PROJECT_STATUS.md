@@ -54,6 +54,11 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 - Adaptive tuning needs >=5 rush runs before it becomes ready.
 - Soft review budgets (e.g. candidate→confirm P90 2000ms) are monitoring thresholds,
   not the final beat-human targets (aim ~500–800ms once stable).
+- The 2026-10-03 run received browser/API search 403s and produced no usable
+  inventory result; the old `NO_INVENTORY` classification was misleading and is
+  now corrected to `SEARCH_FAILURE (search_403)` when both search paths are
+  unverified.  The 403 root cause remains unknown; the next report now exposes
+  refresh/heal counters to guide that investigation.
 - 09-17 loss mode: attempts can end with the server never rendering the
   confirmation page (`bot_latency_loss`) and no ground truth of what the
   server returned.  Failure evidence now dumps the rendered page
@@ -62,14 +67,51 @@ Maximize PolyU badminton rush booking success for any acceptable slot at/after
 
 ## Next Recommended Steps
 
-1. Next 08:30 rush: collect one complete war report chain (probes → source → latencies → result).
-2. Inspect `first_candidate_source` (API vs UI) before enabling `submit_canary`.
-3. After >=5 rush samples, run `adaptive-report` / daily review `--auto-tune`.
-4. 09-18 rush: watch `failed_slot_skip_count` and wave `booking_conflict`
-   feedback; on another confirm-page miss read the newest
-   `logs/booking_evidence/*-fail-confirm-missing*.txt` first.
+1. On the next rush, inspect the new `Search health` section first; if 403s
+   persist, identify the specific session/form failure from fresh evidence
+   rather than labeling the run `NO_INVENTORY`.
+2. Verify `form_refresh_ok_count`, `search_403_count`, `api_search_403_count`,
+   `search_403_heal_refire_count`, and `search_403_heal_fail_count` alongside
+   `first_candidate_source` before changing search or submit strategy.
+3. Keep API submit canary disabled until search and candidate-source behavior
+   is stable; after >=5 comparable rush samples, review adaptive recommendations.
 
 ## Recent Stage History
+
+## 2026-10-05 — 403-aware search failure classification and report health
+
+### Completed
+
+- Replayed `20261003-080005-ee6b`: fire offset was on time, but API search
+  had 8 attempts / 8 403 failures / 0 successful results; the browser search
+  recorded 5 403s.  Both forms refreshed, while 2 token-heal rounds produced
+  1 refire and 1 heal failure.  No candidate or submit was recorded.
+- The old taxonomy ignored those transport metrics and classified generic
+  `no_slots` feedback as `NO_INVENTORY`; that run did not establish that the
+  requested inventory was actually empty.  The underlying cause of the 403s
+  remains undetermined (no claim that token expiry is proven).
+- `classify_run` now emits `SEARCH_FAILURE (search_403)` for a no-candidate
+  run only when browser 403 evidence exists and no API search succeeded (all
+  attempted API searches failed with 403).  Explicit conflicts and specific
+  failure events retain precedence; successful API searches preserve the
+  `NO_INVENTORY` path where appropriate.
+- Rush reports now print API/browser 403 and token-heal counters and state
+  explicitly that inventory was not verified.  Archived reports are not
+  rewritten retroactively.
+
+### Validation
+
+- Regression tests replay the 10-03 metrics, preserve partial-403/no-inventory
+  behavior, and verify report diagnosis/counters.
+- `.venv/bin/python -m pytest tests/ -q`: **124 passed**.
+- No live POSS booking request was made; code changes are limited to failure
+  classification and reporting.
+
+### Git
+
+- Branch: `feature/search-403-failure-classification`
+- Code commit: `0881131`
+- Push status: code commit `0881131` verified on origin before this status update
 
 ## 2026-09-29 — Slot-click navigation tolerance (09-21 lane-death root cause)
 
